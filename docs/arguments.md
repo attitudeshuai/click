@@ -190,3 +190,27 @@ And from the command line:
             f.write('Hello World from second variable!')
         invoke(echo, env={'SRC_2': 'hello.txt'})
 ```
+
+## Sensitive Arguments
+
+```{versionadded} 8.6.0
+```
+
+An argument that carries a secret can be marked `sensitive=True`, just like
+an option (see {ref}`sensitive-values`). Its value is replaced with the fixed
+`'***'` mask in conversion and usage errors raised for the argument, while
+conversion itself and the value received by the command are unaffected.
+Arguments never prompt, so no `hide_input` equivalent is involved.
+
+```{eval-rst}
+.. click:example::
+
+    @click.command()
+    @click.argument("token", type=int, sensitive=True)
+    def cmd(token):
+        click.echo(token)
+
+.. click:run::
+
+    invoke(cmd, args=["supersecret"])
+```

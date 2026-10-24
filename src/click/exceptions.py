@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections.abc as cabc
+import re
 import typing as t
 from gettext import gettext as _
 from gettext import ngettext
@@ -14,6 +15,42 @@ if t.TYPE_CHECKING:
     from .core import Command
     from .core import Context
     from .core import Parameter
+
+
+#: Fixed text substituted for a sensitive parameter's value. The mask never
+#: varies with the value and cannot be customized, so a token or password
+#: cannot be reconstructed from its length or shape.
+_SENSITIVE_VALUE_MASK = "***"
+
+#: Form of the mask in a message position that embeds ``repr(value)``.
+_SENSITIVE_VALUE_MASK_REPR = repr(_SENSITIVE_VALUE_MASK)
+
+
+def _mask_sensitive_value(message: str, value: t.Any) -> str:
+    """Replace ``value`` in an error message with the fixed mask.
+
+    Both ``repr(value)`` (the form built-in :class:`~click.ParamType` errors
+    use via ``{value!r}``) and the raw value are masked. The raw-value pass
+    uses word-boundary lookarounds so a substring like ``"1"`` does not match
+    inside ``"10"``, and ``"ent"`` does not match inside ``"Authentication"``.
+    The empty string is skipped to avoid matching at every boundary.
+
+    This is a best-effort pass over messages produced outside Click's own
+    value-rendering sites (custom types and callbacks, prompted input). It
+    only masks occurrences of the value passed in; no other parameter's
+    value is looked for.
+    """
+    message = message.replace(repr(value), _SENSITIVE_VALUE_MASK_REPR)
+    raw = value if isinstance(value, str) else str(value)
+
+    if raw:
+        message = re.sub(
+            rf"(?<!\w){re.escape(raw)}(?!\w)",
+            _SENSITIVE_VALUE_MASK_REPR,
+            message,
+        )
+
+    return message
 
 
 def _join_param_hints(param_hint: cabc.Sequence[str] | str | None) -> str | None:

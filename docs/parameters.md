@@ -27,6 +27,8 @@ Click supports only two principle types of parameters for scripts (by design): o
 
 On each principle type you can specify {ref}`parameter-types`. Specifying these types helps Click add details to your help pages and help with the handling of those types.
 
+Both options and arguments accept `sensitive=True` for values that must stay out of terminals and logs, such as tokens and passwords. A sensitive parameter's value is replaced by a fixed `'***'` mask in the errors Click raises for it and is omitted from help's default display, while conversion and the value passed to the command stay unchanged. See {ref}`sensitive-values` for the full behavior and its relationship with `hide_input`.
+
 (parameter-names)=
 
 ## Parameter Names

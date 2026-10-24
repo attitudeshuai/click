@@ -44,6 +44,13 @@ replaced with the {func}`password_option` decorator:
         click.echo(f"encoded: to {codecs.encode(password, 'rot13')}")
 ```
 
+`hide_input` only hides the interactive prompt and prompt-retry errors. When
+a secret is passed as a command line value, from an environment variable, or
+from a `default_map` — as with an API token rather than an interactive
+password — mark the option `sensitive=True` instead (or in addition): it
+masks the value in Click's error messages, hides its default from help, and
+implies `hide_input=True` for prompting. See {ref}`sensitive-values`.
+
 ## Confirmation Option
 
 For dangerous operations, it's very useful to be able to ask a user for confirmation. This can be done by adding a

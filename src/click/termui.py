@@ -5,7 +5,6 @@ import inspect
 import io
 import itertools
 import os
-import re
 import sys
 import typing as t
 from contextlib import AbstractContextManager
@@ -15,6 +14,7 @@ from gettext import gettext as _
 from . import _compat
 from ._compat import isatty
 from ._compat import strip_ansi
+from .exceptions import _mask_sensitive_value
 from .exceptions import Abort
 from .exceptions import UsageError
 from .globals import resolve_color_default
@@ -53,27 +53,6 @@ _ansi_colors = {
     "bright_white": 97,
 }
 _ansi_reset_all = "\033[0m"
-
-
-_HIDDEN_INPUT_MASK = "'***'"
-
-
-def _mask_hidden_input(message: str, value: str) -> str:
-    """Replace occurrences of ``value`` in ``message`` with a fixed mask.
-
-    Both ``repr(value)`` (the form built-in :class:`ParamType` errors use
-    via ``{value!r}``) and the raw value are masked. The raw-value pass
-    uses word-boundary lookarounds so a substring like ``"1"`` does not
-    match inside ``"10"``, and ``"ent"`` does not match inside
-    ``"Authentication"``. The empty string is skipped to avoid matching
-    at every boundary.
-    """
-    message = message.replace(repr(value), _HIDDEN_INPUT_MASK)
-    if value:
-        message = re.sub(
-            rf"(?<!\w){re.escape(value)}(?!\w)", _HIDDEN_INPUT_MASK, message
-        )
-    return message
 
 
 def hidden_prompt_func(prompt: str) -> str:
@@ -271,7 +250,11 @@ def prompt(
         try:
             result = value_proc(value)
         except UsageError as e:
-            message = _mask_hidden_input(e.message, value) if hide_input else e.message
+            if hide_input:
+                message = _mask_sensitive_value(e.message, value)
+            else:
+                message = e.message
+
             echo(_("Error: {message}").format(message=message), err=err)
             continue
         if not confirmation_prompt:

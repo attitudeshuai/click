@@ -2,6 +2,14 @@
 
 Unreleased
 
+- Add a `sensitive` parameter to `Option` and `Argument`. When enabled, the
+  parameter's value is replaced by a fixed `'***'` mask in conversion,
+  missing, and usage errors Click raises for it (from the command line, an
+  environment variable, or a `default_map`; each element of multi-value and
+  tuple parameters is masked separately), and its default is not displayed in
+  help. Conversion itself and values received by callbacks and commands are
+  unaffected. For options, `sensitive` implies `hide_input=True`; combining
+  it with `hide_input=False` or with a boolean flag raises `TypeError`.
 - A parameter name that is not a valid Python identifier, or that is a Python
   keyword, is deprecated and raises `TypeError` in Click 9.0. {pr}`3866`
 - An {class}`Option` name written as a Python identifier is deprecated when it

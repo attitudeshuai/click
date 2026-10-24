@@ -14,6 +14,8 @@ from gettext import ngettext
 
 from ._compat import _get_argv_encoding
 from ._compat import open_stream
+from .exceptions import _SENSITIVE_VALUE_MASK
+from .exceptions import _SENSITIVE_VALUE_MASK_REPR
 from .exceptions import BadParameter
 from .utils import _LazyFile
 from .utils import _safecall
@@ -60,6 +62,28 @@ else:
 class ParamTypeInfoDict(t.TypedDict):
     param_type: str
     name: str
+
+
+def _is_sensitive(param: Parameter | None) -> bool:
+    """Whether ``param`` is marked ``sensitive`` and its value must be
+    masked wherever Click renders it.
+
+    ``getattr`` also covers custom :class:`Parameter` subclasses that do
+    not go through :meth:`Parameter.__init__`.
+    """
+    return param is not None and getattr(param, "sensitive", False)
+
+
+def _error_value_repr(value: t.Any, param: Parameter | None) -> str:
+    """Render ``value`` for a quoted value position (``{value!r}``) in a
+    conversion error message. A sensitive parameter gets the fixed mask
+    instead of ``repr(value)``, so a token or password passed on the
+    command line never reaches the error text.
+    """
+    if _is_sensitive(param):
+        return _SENSITIVE_VALUE_MASK_REPR
+
+    return repr(value)
 
 
 class ParamType(t.Generic[_ValueT_co, _InputT_contra], abc.ABC):
@@ -281,10 +305,15 @@ class FuncParamType(ParamType[_ValueT_co], t.Generic[_ValueT_contra, _ValueT_co]
             message = str(exc)
 
             if not message:
-                try:
-                    message = str(value)
-                except UnicodeError:
-                    message = t.cast("bytes", value).decode("utf-8", "replace")
+                # An empty message falls back to echoing the raw value,
+                # which must be masked for a sensitive parameter.
+                if _is_sensitive(param):
+                    message = _SENSITIVE_VALUE_MASK_REPR
+                else:
+                    try:
+                        message = str(value)
+                    except UnicodeError:
+                        message = t.cast("bytes", value).decode("utf-8", "replace")
 
             self.fail(message, param, ctx)
 
@@ -470,24 +499,38 @@ class Choice(ParamType[_ValueT_co], t.Generic[_ValueT_co]):
             )
         except StopIteration:
             self.fail(
-                self.get_invalid_choice_message(value=value, ctx=ctx),
+                self.get_invalid_choice_message(value=value, ctx=ctx, param=param),
                 param=param,
                 ctx=ctx,
             )
 
-    def get_invalid_choice_message(self, value: t.Any, ctx: Context | None) -> str:
+    def get_invalid_choice_message(
+        self,
+        value: t.Any,
+        ctx: Context | None,
+        param: Parameter | None = None,
+    ) -> str:
         """Get the error message when the given choice is invalid.
 
         :param value: The invalid value.
+        :param param: The parameter converting the value, used to mask the
+            value when it is sensitive.
+
+        .. versionchanged:: 8.6.0
+            Added the ``param`` argument.
 
         .. versionadded:: 8.2
         """
         choices_str = ", ".join(map(repr, self._normalized_mapping(ctx=ctx).values()))
         return ngettext(
-            "{value!r} is not {choice}.",
-            "{value!r} is not one of {choices}.",
+            "{value} is not {choice}.",
+            "{value} is not one of {choices}.",
             len(self.choices),
-        ).format(value=value, choice=choices_str, choices=choices_str)
+        ).format(
+            value=_error_value_repr(value, param),
+            choice=choices_str,
+            choices=choices_str,
+        )
 
     def __repr__(self) -> str:
         return _("Choice({choices})").format(choices=list(self.choices))
@@ -578,10 +621,14 @@ class DateTime(ParamType[datetime]):
         formats_str = ", ".join(map(repr, self.formats))
         self.fail(
             ngettext(
-                "{value!r} does not match the format {format}.",
-                "{value!r} does not match the formats {formats}.",
+                "{value} does not match the format {format}.",
+                "{value} does not match the formats {formats}.",
                 len(self.formats),
-            ).format(value=value, format=formats_str, formats=formats_str),
+            ).format(
+                value=_error_value_repr(value, param),
+                format=formats_str,
+                formats=formats_str,
+            ),
             param,
             ctx,
         )
@@ -602,8 +649,8 @@ class _NumberParamTypeBase(
             return self._number_class(value)
         except ValueError:
             self.fail(
-                _("{value!r} is not a valid {number_type}.").format(
-                    value=value, number_type=self.name
+                _("{value} is not a valid {number_type}.").format(
+                    value=_error_value_repr(value, param), number_type=self.name
                 ),
                 param,
                 ctx,
@@ -686,9 +733,12 @@ class _NumberRangeBase(
                 return self._clamp(max, -1, self.max_open)
 
         if lt_min or gt_max:
+            # This position embeds the converted value without quotes, so
+            # the unquoted form of the mask is used for sensitive params.
+            value_display = _SENSITIVE_VALUE_MASK if _is_sensitive(param) else rv
             self.fail(
                 _("{value} is not in the range {range}.").format(
-                    value=rv, range=self._describe_range()
+                    value=value_display, range=self._describe_range()
                 ),
                 param,
                 ctx,
@@ -873,9 +923,10 @@ class BoolParamType(ParamType[bool]):
         normalized = self.str_to_bool(value)
         if normalized is None:
             self.fail(
-                _(
-                    "{value!r} is not a valid boolean. Recognized values: {states}"
-                ).format(value=value, states=", ".join(sorted(self.bool_states))),
+                _("{value} is not a valid boolean. Recognized values: {states}").format(
+                    value=_error_value_repr(value, param),
+                    states=", ".join(sorted(self.bool_states)),
+                ),
                 param,
                 ctx,
             )
@@ -900,7 +951,11 @@ class UUIDParameterType(ParamType[uuid.UUID]):
             return uuid.UUID(value)
         except ValueError:
             self.fail(
-                _("{value!r} is not a valid UUID.").format(value=value), param, ctx
+                _("{value} is not a valid UUID.").format(
+                    value=_error_value_repr(value, param)
+                ),
+                param,
+                ctx,
             )
 
     def __repr__(self) -> str:
@@ -1020,11 +1075,15 @@ class File(ParamType[t.IO[t.Any]]):
 
             return f
         except OSError as e:
-            self.fail(
-                f"'{format_filename(value)}': {e.strerror}",
-                param,
-                ctx,
-            )
+            # The filename is deliberately embedded raw (no ``repr``) so
+            # Windows backslashes stay as typed; only a sensitive parameter
+            # swaps it for the mask.
+            if _is_sensitive(param):
+                filename = _SENSITIVE_VALUE_MASK_REPR
+            else:
+                filename = f"'{format_filename(value)}'"
+
+            self.fail(f"{filename}: {e.strerror}", param, ctx)
 
     def shell_complete(
         self, ctx: Context, param: Parameter, incomplete: str
@@ -1179,8 +1238,9 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
                 if not self.exists:
                     return self.coerce_path_result(rv)
                 self.fail(
-                    _("{name} {filename!r} does not exist.").format(
-                        name=self.name.title(), filename=format_filename(value)
+                    _("{name} {filename} does not exist.").format(
+                        name=self.name.title(),
+                        filename=_error_value_repr(format_filename(value), param),
                     ),
                     param,
                     ctx,
@@ -1188,16 +1248,18 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
 
             if not self.file_okay and stat.S_ISREG(st.st_mode):
                 self.fail(
-                    _("{name} {filename!r} is a file.").format(
-                        name=self.name.title(), filename=format_filename(value)
+                    _("{name} {filename} is a file.").format(
+                        name=self.name.title(),
+                        filename=_error_value_repr(format_filename(value), param),
                     ),
                     param,
                     ctx,
                 )
             if not self.dir_okay and stat.S_ISDIR(st.st_mode):
                 self.fail(
-                    _("{name} {filename!r} is a directory.").format(
-                        name=self.name.title(), filename=format_filename(value)
+                    _("{name} {filename} is a directory.").format(
+                        name=self.name.title(),
+                        filename=_error_value_repr(format_filename(value), param),
                     ),
                     param,
                     ctx,
@@ -1205,8 +1267,9 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
 
             if self.readable and not os.access(rv, os.R_OK):
                 self.fail(
-                    _("{name} {filename!r} is not readable.").format(
-                        name=self.name.title(), filename=format_filename(value)
+                    _("{name} {filename} is not readable.").format(
+                        name=self.name.title(),
+                        filename=_error_value_repr(format_filename(value), param),
                     ),
                     param,
                     ctx,
@@ -1214,8 +1277,9 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
 
             if self.writable and not os.access(rv, os.W_OK):
                 self.fail(
-                    _("{name} {filename!r} is not writable.").format(
-                        name=self.name.title(), filename=format_filename(value)
+                    _("{name} {filename} is not writable.").format(
+                        name=self.name.title(),
+                        filename=_error_value_repr(format_filename(value), param),
                     ),
                     param,
                     ctx,
@@ -1223,8 +1287,9 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
 
             if self.executable and not os.access(value, os.X_OK):
                 self.fail(
-                    _("{name} {filename!r} is not executable.").format(
-                        name=self.name.title(), filename=format_filename(value)
+                    _("{name} {filename} is not executable.").format(
+                        name=self.name.title(),
+                        filename=_error_value_repr(format_filename(value), param),
                     ),
                     param,
                     ctx,

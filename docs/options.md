@@ -798,3 +798,67 @@ value will be `flag_value`.
     invoke(hello, args=["--name", "Value"])
     invoke(hello, args=["--name"])
 ```
+
+(sensitive-values)=
+
+## Sensitive Values
+
+```{versionadded} 8.6.0
+```
+
+Options that carry secrets, such as API tokens or passwords passed on the
+command line, can be marked `sensitive=True`. A sensitive option behaves
+exactly like a regular one for valid input — the value is converted normally
+and passed to callbacks and the command unchanged — but the value never
+appears in Click's own output:
+
+-   Conversion errors, missing errors, and usage errors raised for the
+    option show a fixed mask (`'***'`) instead of the value, while still
+    naming the option and the reason for the error.
+-   The default value is never displayed in `--help`, even when
+    `show_default` is enabled (on the option or through
+    {attr}`Context.show_default`).
+
+The masking applies no matter where the value came from: the command line,
+an environment variable, or a `default_map`. With `multiple=True`, `nargs`,
+or a tuple type, every element is masked separately. This makes it safe to
+paste an error message into a ticket or a log platform:
+
+```{eval-rst}
+.. click:example::
+
+    @click.command()
+    @click.option("--token", type=int, sensitive=True)
+    def cmd(token):
+        click.echo(token)
+
+.. click:run::
+
+    invoke(cmd, args=["--token", "supersecret"])
+```
+
+### Relationship with `hide_input`
+
+`hide_input` and `sensitive` protect different surfaces:
+
+-   `hide_input` only covers interactive prompts: it hides what is typed at
+    the prompt and masks the value in prompt-retry errors.
+-   `sensitive` covers errors produced from command line, environment
+    variable, and default map values, and the default in help.
+
+A sensitive option that prompts must not echo the typed secret either, so
+`sensitive=True` implies `hide_input=True`. Passing both
+`sensitive=True` and `hide_input=False` is rejected at declaration time.
+The reverse is not implied: `hide_input=True` on its own never masks
+errors from values passed on the command line.
+
+`sensitive` is not compatible with boolean flags, which take no value;
+declaring both raises a `TypeError`, like other invalid combinations.
+
+### Limitations
+
+The mask is fixed and cannot be customized. Only errors raised for the
+sensitive option itself are covered; values of other parameters mentioned in
+an error are not tracked or masked. Error messages built by a custom type or
+callback that embed the value themselves are masked on a best-effort basis,
+and global output such as what the command itself echoes is not affected.

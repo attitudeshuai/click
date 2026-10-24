@@ -24,6 +24,8 @@ from types import TracebackType
 from . import types
 from ._utils import FLAG_NEEDS_VALUE
 from ._utils import UNSET
+from .exceptions import _mask_sensitive_value
+from .exceptions import _SENSITIVE_VALUE_MASK
 from .exceptions import Abort
 from .exceptions import BadParameter
 from .exceptions import ClickException
@@ -167,6 +169,23 @@ def augment_usage_errors(
         if e.ctx is None:
             e.ctx = ctx
         raise
+
+
+def _iter_sensitive_value_leaves(value: t.Any) -> cabc.Iterator[t.Any]:
+    """Yield each scalar value carried by a raw parameter value.
+
+    Raw values are shaped as a scalar, a sequence (``nargs`` / environment
+    variable splitting), or a sequence of sequences (``multiple`` with
+    ``nargs``). Strings and bytes are leaves even though they iterate, and
+    sentinels (``UNSET``, ``FLAG_NEEDS_VALUE``) and ``None`` carry no user
+    text and are skipped.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, cabc.Iterable):
+        if value is not UNSET and value is not FLAG_NEEDS_VALUE and value is not None:
+            yield value
+    else:
+        for item in value:
+            yield from _iter_sensitive_value_leaves(item)
 
 
 def iter_params_for_processing(
@@ -2298,6 +2317,18 @@ class Parameter(ABC):
                         cannot be required, a ValueError will be raised otherwise.
     :param help: the help string. It is dedented and get a deprecated label if
         appropriate.
+    :param sensitive: hide the parameter's value from Click's own output.
+        Conversion, missing, and usage errors raised for this parameter show
+        a fixed mask (``'***'``) instead of the value, and a default value is
+        not displayed in help. The converted value itself is unaffected, so
+        callbacks and the command still receive the real value. Values coming
+        from the command line, an environment variable, or a default map are
+        all masked. Use this for tokens and passwords passed as command line
+        values; :attr:`Option.hide_input` separately hides interactive prompt
+        echo and is implied by this flag for options.
+
+    .. versionchanged:: 8.6.0
+        Added the ``sensitive`` parameter.
 
     .. versionchanged:: 8.5.1
         New ``help`` parameter to replace the one from :class:`Option` and
@@ -2388,6 +2419,10 @@ class Parameter(ABC):
     )
     deprecated: bool | str
     help: str | None
+    sensitive: bool
+    """When ``True``, the parameter's value is masked in Click-rendered
+    error messages and omitted from help's default display.
+    """
 
     def __init_subclass__(cls, **kwargs: t.Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -2432,6 +2467,7 @@ class Parameter(ABC):
         | None = None,
         deprecated: bool | str = False,
         help: str | None = None,
+        sensitive: bool = False,
     ) -> None:
         self.name, self.opts, self.secondary_opts = self._parse_decls(
             param_decls or (), expose_value
@@ -2463,6 +2499,7 @@ class Parameter(ABC):
         self.envvar = envvar
         self._custom_shell_complete = shell_complete
         self.deprecated = deprecated
+        self.sensitive = sensitive
 
         if help:
             help = inspect.cleandoc(help)
@@ -2776,10 +2813,58 @@ class Parameter(ABC):
 
                 return tuple(self.type(x, self, ctx) for x in value)
 
-        if self.multiple:
-            return tuple(convert(x) for x in check_iter(value))
+        try:
+            if self.multiple:
+                return tuple(convert(x) for x in check_iter(value))
 
-        return convert(value)
+            return convert(value)
+        except BadParameter as e:
+            # Built-in types render the mask at the value position for a
+            # sensitive parameter. The rebuild additionally covers messages
+            # from custom types that embed the raw value themselves.
+            if self.sensitive:
+                masked = self._mask_bad_parameter(ctx, e, value)
+
+                if masked is not e:
+                    raise masked from e
+
+            raise
+
+    def _mask_bad_parameter(
+        self, ctx: Context, error: BadParameter, value: t.Any
+    ) -> BadParameter:
+        """Return ``error`` with this sensitive parameter's raw value masked
+        in its message, or ``error`` unchanged when its message does not
+        contain any of ``value``'s leaves.
+
+        Only the parameter's own value is replaced: there is no cross
+        parameter tracking, so a value belonging to another parameter is
+        never looked for. Each leaf of a multi-value or tuple value is
+        masked separately.
+        """
+        # A message already carrying the mask had its value position
+        # rendered by a built-in type. The raw-value pass below is only a
+        # safety net for messages built outside Click's rendering sites:
+        # running it over an already masked message could replace an
+        # unrelated short word (a value of ``"a"`` in ``... is not a
+        # valid ...``), so stop here.
+        if _SENSITIVE_VALUE_MASK in error.message:
+            return error
+
+        message = error.message
+
+        for leaf in _iter_sensitive_value_leaves(value):
+            message = _mask_sensitive_value(message, leaf)
+
+        if message == error.message:
+            return error
+
+        return BadParameter(
+            message,
+            ctx=error.ctx or ctx,
+            param=self if error.param is None else error.param,
+            param_hint=error.param_hint,
+        )
 
     def value_is_missing(self, value: t.Any) -> bool:
         """A value is considered missing if:
@@ -2812,6 +2897,10 @@ class Parameter(ABC):
 
         :meta private:
         """
+        # Keep the raw value around so a :class:`BadParameter` raised by the
+        # callback can have a sensitive parameter's own value masked in it.
+        raw_value = value
+
         # shelter `type_cast_value` from ever seeing an `UNSET` value by handling the
         # cases in which `UNSET` gets special treatment explicitly at this layer
         #
@@ -2836,7 +2925,7 @@ class Parameter(ABC):
             unset_keys = {k: None for k, v in ctx.params.items() if v is UNSET}
             # No UNSET values, call the callback as usual.
             if not unset_keys:
-                value = self.callback(ctx, self, value)
+                value = self._invoke_callback(ctx, value, raw_value)
 
             # Legacy case: provide a temporarily manipulated context to the callback
             # to hide UNSET values as None.
@@ -2851,7 +2940,7 @@ class Parameter(ABC):
                     # Update the context parameters to replace UNSET with None.
                     ctx.params.update(unset_keys)
                     # Feed these fake context parameters to the callback.
-                    value = self.callback(ctx, self, value)
+                    value = self._invoke_callback(ctx, value, raw_value)
                     # Restore the UNSET values in the context parameters.
                     ctx.params.update(
                         {
@@ -2864,6 +2953,21 @@ class Parameter(ABC):
                     )
 
         return value
+
+    def _invoke_callback(self, ctx: Context, value: t.Any, raw_value: t.Any) -> t.Any:
+        """Call the parameter callback, masking its value-sensitive errors."""
+        assert self.callback is not None
+
+        try:
+            return self.callback(ctx, self, value)
+        except BadParameter as e:
+            if self.sensitive:
+                masked = self._mask_bad_parameter(ctx, e, raw_value)
+
+                if masked is not e:
+                    raise masked from e
+
+            raise
 
     def resolve_envvar_value(self, ctx: Context) -> str | None:
         """Returns the value found in the environment variable(s) attached to this
@@ -3082,6 +3186,11 @@ class Option(Parameter):
         without a value.
     :param hide_input: If this is ``True`` then the input on the prompt
         will be hidden from the user. This is useful for password input.
+        This only covers interactive prompting; it does not mask values in
+        errors raised for command line input, which is what
+        ``sensitive`` is for. ``sensitive`` implies ``hide_input``, so
+        passing ``hide_input=False`` together with ``sensitive=True`` is
+        rejected.
     :param is_flag: forces this option to act as a flag.  The default is
                     auto detection.
     :param flag_value: which value should be used for this flag if it's
@@ -3098,6 +3207,13 @@ class Option(Parameter):
                                context.
     :param help: the help string.
     :param hidden: hide this option from help outputs.
+    :param sensitive: mark the option as carrying a secret such as a token
+        or password. Its value is masked in errors raised for this option
+        and never shown as a default in help; see
+        :class:`Parameter` for the full behavior. A sensitive option that
+        prompts implies ``hide_input=True``, so the two must not be passed
+        with ``hide_input=False``. Sensitive is incompatible with boolean
+        flags, which take no value.
     :param attrs: Other command arguments described in :class:`Parameter`.
 
     .. versionchanged:: 8.4.0
@@ -3153,7 +3269,7 @@ class Option(Parameter):
         prompt: bool | str = False,
         confirmation_prompt: bool | str = False,
         prompt_required: bool = True,
-        hide_input: bool = False,
+        hide_input: bool | None = None,
         is_flag: bool | None = None,
         flag_value: t.Any = UNSET,
         multiple: bool = False,
@@ -3191,7 +3307,12 @@ class Option(Parameter):
         self.prompt = prompt_text
         self.confirmation_prompt = confirmation_prompt
         self.prompt_required = prompt_required
-        self.hide_input = hide_input
+        # ``sensitive`` protects the same prompted surface (typed input and
+        # retry errors), so it implies ``hide_input``. The reverse is not
+        # true: ``hide_input`` alone never masks errors from command line
+        # values. An explicit ``hide_input=False`` is rejected in
+        # ``_validate`` below; ``None`` means the flag was not given.
+        self.hide_input = self.sensitive or bool(hide_input)
         self.hidden = hidden
 
         # Phase 2: flag-kind inference.
@@ -3222,7 +3343,7 @@ class Option(Parameter):
         self.show_envvar = show_envvar
 
         # Phase 5: validate. Raises on illegal kwarg combinations.
-        self._validate(prompt, deprecated)
+        self._validate(prompt, deprecated, hide_input)
 
     @property
     def is_bool_flag(self) -> bool:
@@ -3342,7 +3463,12 @@ class Option(Parameter):
             return self.flag_activation_value
         return value
 
-    def _validate(self, prompt: bool | str, deprecated: bool | str) -> None:
+    def _validate(
+        self,
+        prompt: bool | str,
+        deprecated: bool | str,
+        hide_input: bool | None,
+    ) -> None:
         """Raise :class:`TypeError` / :class:`ValueError` on illegal kwarg combinations.
 
         Called once, after every other attribute has been assigned, so each check can
@@ -3358,6 +3484,13 @@ class Option(Parameter):
             raise TypeError("Secondary flag is not valid for non-boolean flag.")
         if self.is_bool_flag and self.hide_input and self.prompt is not None:
             raise TypeError("'prompt' with 'hide_input' is not valid for boolean flag.")
+        if self.is_bool_flag and self.sensitive:
+            raise TypeError("'sensitive' is not valid for boolean flag.")
+        if self.sensitive and hide_input is False:
+            raise TypeError(
+                "'sensitive' implies 'hide_input', so 'hide_input=False' is"
+                " not valid with 'sensitive=True'."
+            )
         if self.count:
             if self.multiple:
                 raise TypeError("'count' is not valid with 'multiple'.")
@@ -3653,6 +3786,13 @@ class Option(Parameter):
         elif ctx.show_default is not None:
             show_default = ctx.show_default
 
+        # A sensitive parameter's default is a secret too, so the default is
+        # never echoed in help, even with ``show_default`` or a custom
+        # ``show_default`` string.
+        if self.sensitive:
+            show_default = False
+            show_default_is_str = False
+
         if show_default_is_str or (
             show_default and (default_value not in (None, UNSET))
         ):
@@ -3899,6 +4039,12 @@ class Argument(Parameter):
     All parameters are passed onwards to the constructor of :class:`Parameter`.
 
     :param help: the help string.
+    :param sensitive: hide the argument's value from Click-rendered error
+        messages, as described on :class:`Parameter`. Arguments never prompt,
+        so no :attr:`Option.hide_input` equivalent is involved.
+
+    .. versionchanged:: 8.6.0
+        Added the ``sensitive`` parameter.
 
     .. versionchanged:: 8.5.0
         Added the ``help`` parameter.

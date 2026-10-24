@@ -303,6 +303,16 @@ classes and functions.
 .. autoexception:: BadArgumentUsage
 ```
 
+```{eval-rst}
+.. autoexception:: CleanupError
+   :members:
+```
+
+```{eval-rst}
+.. autoclass:: CleanupFailure
+   :members:
+```
+
 ## Formatting
 
 ```{eval-rst}

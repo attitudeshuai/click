@@ -17,8 +17,19 @@ Unreleased
 - {attr}`Parameter.human_readable_name` is deprecated and will be removed in
   Click 9.0. Use {attr}`Parameter.spec` instead. It returned the internal name
   for options, so its value changes from `my_option` to `--my-option`. Click no
-  longer reads it, and a subclass that overrides it gets a warning when the class
-  is defined. {pr}`3877`
+  longer reads it, and a subclass that overrides it gets a warning when the
+  class is defined. {pr}`3877`
+- A cleanup callback registered with {meth}`Context.call_on_close` or a
+  resource entered with {meth}`Context.with_resource` that raises while the
+  context is closing no longer replaces the exception raised by the command,
+  and one failing cleanup step no longer hides the rest. When the command
+  body raised an exception, it remains the primary conclusion and the
+  cleanup failures are attached to it as a tuple of {exc}`CleanupFailure`
+  in its `cleanup_failures` attribute, ordered from the innermost context
+  outward. When the body finished normally, Click raises {exc}`CleanupError`
+  carrying every failure with its source, command path, exception type, and
+  message. Every cleanup step still runs and successful closes behave
+  exactly as before.
 
 ## Version 8.5.1
 

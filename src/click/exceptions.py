@@ -376,3 +376,142 @@ class Exit(RuntimeError):
 
     def __init__(self, code: int = 0) -> None:
         self.exit_code = code
+
+
+class CleanupFailure:
+    """Details about a single cleanup callback or resource that raised while
+    a :class:`~click.Context` was closing.
+
+    :param source: Identifies what failed, such as a callback's qualified
+        name or a resource's type.
+    :param command_path: The context's :attr:`~click.Context.command_path`
+        at the time of the failure, if one was available.
+    :param exception: The exception that the cleanup raised.
+
+    .. versionadded:: 8.6.0
+    """
+
+    __slots__ = ("command_path", "exception", "source")
+
+    source: t.Final[str]
+    command_path: t.Final[str | None]
+    exception: t.Final[BaseException]
+
+    def __init__(
+        self,
+        source: str,
+        command_path: str | None,
+        exception: BaseException,
+    ) -> None:
+        self.source = source
+        self.command_path = command_path
+        self.exception = exception
+
+    @property
+    def exception_type(self) -> str:
+        """The name of the raised exception's type."""
+        return type(self.exception).__name__
+
+    @property
+    def exception_message(self) -> str:
+        """The message of the raised exception."""
+        return str(self.exception)
+
+    def __str__(self) -> str:
+        rv = f"{self.source} raised {self.exception_type}"
+        message = self.exception_message
+
+        if message:
+            rv += f": {message}"
+
+        if self.command_path:
+            rv += f" (command path {self.command_path!r})"
+
+        return rv
+
+
+class CleanupError(RuntimeError):
+    """Raised when one or more cleanup callbacks or resources fail while a
+    context is closing and the context body did not raise.
+
+    Every failure is recorded in :attr:`failures`; a failing cleanup step
+    never prevents the remaining steps from running. The message lists all
+    failures, each with its source, command path, exception type, and
+    message.
+
+    If the context body raised its own exception, that exception remains
+    the primary conclusion instead. The cleanup failures are attached to
+    it as a tuple of :class:`CleanupFailure` in its ``cleanup_failures``
+    attribute, ordered from the innermost context outward.
+
+    .. versionadded:: 8.6.0
+    """
+
+    __slots__ = ("failures",)
+
+    failures: tuple[CleanupFailure, ...]
+
+    def __init__(self, failures: cabc.Sequence[CleanupFailure]) -> None:
+        self.failures = tuple(failures)
+        super().__init__()
+
+    def __str__(self) -> str:
+        count = len(self.failures)
+        noun = "handler" if count == 1 else "handlers"
+        details = "\n".join(f"  {failure}" for failure in self.failures)
+        return (
+            f"{count} cleanup {noun} failed while closing the click context:\n{details}"
+        )
+
+
+#: Attribute holding a tuple of :class:`CleanupFailure` attached to the
+#: exception raised by a context body when cleanup also fails.
+_CLEANUP_FAILURES_ATTR = "cleanup_failures"
+
+#: Fallback for exception objects that cannot carry arbitrary attributes
+#: (custom C types, unusual ``__slots__`` on alternative runtimes).
+_cleanup_failures_fallback: dict[int, tuple[CleanupFailure, ...]] = {}
+
+
+def _get_cleanup_failures(
+    exc: BaseException,
+) -> tuple[CleanupFailure, ...]:
+    """Return the cleanup failures previously attached to *exc*, if any."""
+    try:
+        failures = getattr(exc, _CLEANUP_FAILURES_ATTR, ())
+    except Exception:
+        failures = _cleanup_failures_fallback.get(id(exc), ())
+
+    return failures if isinstance(failures, tuple) else ()
+
+
+def _record_cleanup_failures(
+    exc: BaseException, failures: cabc.Sequence[CleanupFailure]
+) -> tuple[CleanupFailure, ...]:
+    """Attach cleanup *failures* to the body exception *exc*.
+
+    Failures already attached by inner contexts are kept and come first,
+    so the resulting tuple reads from the innermost context outward.
+    """
+    combined = (*_get_cleanup_failures(exc), *failures)
+
+    try:
+        setattr(exc, _CLEANUP_FAILURES_ATTR, combined)
+    except (AttributeError, TypeError):
+        _cleanup_failures_fallback[id(exc)] = combined
+
+    return combined
+
+
+def _extend_cleanup_error(
+    error: CleanupError, failures: cabc.Sequence[CleanupFailure]
+) -> CleanupError:
+    """Merge another nesting level's failures into an existing
+    :class:`CleanupError`, keeping the innermost failures first.
+
+    Used when an outer context closes and receives a :class:`CleanupError`
+    from an inner one: cleanup is one phase across the whole context chain,
+    so its conclusion stays a single exception listing every failure.
+    """
+    error.failures = (*error.failures, *failures)
+    return error

@@ -109,6 +109,26 @@ The following common subclasses exist:
 - {exc}`FileError` this is an error that is raised by the
   {class}`FileType` if Click encounters issues opening the file.
 
+## Errors While Closing
+
+Functions registered with {meth}`Context.call_on_close` and resources
+entered with {meth}`Context.with_resource` run when the context closes, in
+reverse registration order. Every one of them runs even if an earlier one
+raises.
+
+If the command body finished normally but a cleanup callback or resource
+exit raises, Click raises a {exc}`CleanupError`. It is not a
+{exc}`ClickException`, so it propagates in both standalone mode and
+``standalone_mode=False``; its {attr}`~CleanupError.failures` attribute is a
+tuple of {exc}`CleanupFailure` objects, one per failed step, each recording
+the callback or resource identity, the command path, and the exception type
+and message.
+
+If the command body raised its own exception, that exception remains the
+one that propagates. The cleanup failures are attached to it as a tuple in
+its ``cleanup_failures`` attribute, ordered from the innermost context
+outward.
+
 (help-page-exit-codes)=
 
 ## Help Pages and Exit Codes

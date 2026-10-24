@@ -13,19 +13,23 @@ from collections import abc
 from collections import Counter
 from contextlib import AbstractContextManager
 from contextlib import contextmanager
-from contextlib import ExitStack
 from functools import update_wrapper
 from gettext import gettext as _
 from gettext import ngettext
 from itertools import repeat
 from types import FrameType
+from types import MethodType
 from types import TracebackType
 
 from . import types
 from ._utils import FLAG_NEEDS_VALUE
 from ._utils import UNSET
+from .exceptions import _extend_cleanup_error
+from .exceptions import _record_cleanup_failures
 from .exceptions import Abort
 from .exceptions import BadParameter
+from .exceptions import CleanupError
+from .exceptions import CleanupFailure
 from .exceptions import ClickException
 from .exceptions import Exit
 from .exceptions import MissingParameter
@@ -59,6 +63,103 @@ V = t.TypeVar("V")
 # Reserved storage name of the automatic help option. No user parameter is
 # expected to claim it.
 _HELP_OPTION_STORAGE_NAME = "_click_default_help"
+
+
+def _describe_callback(callback: t.Callable[..., t.Any]) -> str:
+    """Build a stable identifier for a callback registered with
+    :meth:`Context.call_on_close`, using its qualified name when possible."""
+    name = getattr(callback, "__qualname__", None) or getattr(
+        callback, "__name__", None
+    )
+
+    if name:
+        module = getattr(callback, "__module__", None)
+        return f"callback '{module}.{name}'" if module else f"callback '{name}'"
+
+    return f"callback {callback!r}"
+
+
+def _describe_resource(context_manager: t.Any) -> str:
+    """Build an identifier for a resource entered with
+    :meth:`Context.with_resource`, using its type and a ``name`` when the
+    resource exposes one (such as a file object's path)."""
+    cls = type(context_manager)
+    label = f"resource '{cls.__module__}.{cls.__qualname__}'"
+
+    try:
+        name = getattr(context_manager, "name", None)
+    except Exception:
+        name = None
+
+    if isinstance(name, str):
+        label += f" ({name!r})"
+
+    return label
+
+
+class _CloseEntry(t.NamedTuple):
+    """A single cleanup step stored on :class:`_CloseStack`."""
+
+    exit: t.Callable[
+        [type[BaseException] | None, BaseException | None, TracebackType | None],
+        bool | None,
+    ]
+    source: str
+
+
+class _CloseStack:
+    """Registry of cleanup steps with the same registration semantics as
+    :class:`contextlib.ExitStack`. Unlike ``ExitStack``, unwinding is done by
+    :meth:`Context._close_with_exception_info`, which invokes every step and
+    attributes each failure instead of letting one failure replace another.
+    """
+
+    def __init__(self) -> None:
+        self._entries: list[_CloseEntry] = []
+
+    def callback(self, callback: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+        """Register a no-argument cleanup callback, mirroring
+        :meth:`contextlib.ExitStack.callback`."""
+
+        def _exit_wrapper(
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> None:
+            callback()
+
+        self._entries.append(_CloseEntry(_exit_wrapper, _describe_callback(callback)))
+        return callback
+
+    def enter_context(self, context_manager: AbstractContextManager[V]) -> V:
+        """Enter a context manager and register its exit, mirroring
+        :meth:`contextlib.ExitStack.enter_context`."""
+        cls = type(context_manager)
+
+        try:
+            enter = cls.__enter__
+            exit_ = cls.__exit__
+        except AttributeError:
+            raise TypeError(
+                f"'{cls.__module__}.{cls.__qualname__}' object does "
+                "not support the context manager protocol"
+            ) from None
+
+        result = enter(context_manager)
+        self._entries.append(
+            _CloseEntry(
+                MethodType(exit_, context_manager),
+                _describe_resource(context_manager),
+            )
+        )
+        return result
+
+    def drain(self) -> list[_CloseEntry]:
+        """Remove and return every entry in close (LIFO) order."""
+        entries = self._entries
+        self._entries = []
+        entries.reverse()
+        return entries
 
 
 def _complete_visible_commands(
@@ -365,7 +466,7 @@ class Context:
     _depth: int
     _parameter_source: dict[str, ParameterSource]
     _param_default_explicit: dict[str, bool]
-    _exit_stack: ExitStack
+    _exit_stack: _CloseStack
 
     def __init__(
         self,
@@ -541,7 +642,7 @@ class Context:
         # parameter name and both fall back to their default value.
         # Refs: https://github.com/pallets/click/issues/3403
         self._param_default_explicit = {}
-        self._exit_stack = ExitStack()
+        self._exit_stack = _CloseStack()
 
     @property
     def protected_args(self) -> list[str]:
@@ -588,10 +689,14 @@ class Context:
         tb: TracebackType | None,
     ) -> bool | None:
         self._depth -= 1
-        exit_result: bool | None = None
-        if self._depth == 0:
-            exit_result = self._close_with_exception_info(exc_type, exc_value, tb)
-        pop_context()
+
+        try:
+            exit_result: bool | None = None
+
+            if self._depth == 0:
+                exit_result = self._close_with_exception_info(exc_type, exc_value, tb)
+        finally:
+            pop_context()
 
         return exit_result
 
@@ -680,10 +785,11 @@ class Context:
         statement. The resource will be cleaned up when the context is
         popped.
 
-        Uses :meth:`contextlib.ExitStack.enter_context`. It calls the
-        resource's ``__enter__()`` method and returns the result. When
-        the context is popped, it closes the stack, which calls the
-        resource's ``__exit__()`` method.
+        It calls the resource's ``__enter__()`` method and returns the
+        result. When the context is popped, it calls the resource's
+        ``__exit__()`` method, receiving the exception in flight so a
+        resource may handle it the same way it does in a ``with``
+        statement.
 
         To register a cleanup function for something that isn't a
         context manager, use :meth:`call_on_close`. Or use something
@@ -712,6 +818,11 @@ class Context:
         protocol which would be used in a ``with`` statement should be
         registered with :meth:`with_resource` instead.
 
+        Every registered function is called even if an earlier one
+        raises. A failure during teardown is reported together with all
+        other teardown failures instead of replacing the exception
+        raised by the command, if any. See :class:`~click.CleanupError`.
+
         :param f: The function to execute on teardown.
         """
         return self._exit_stack.callback(f)
@@ -720,6 +831,10 @@ class Context:
         """Invoke all close callbacks registered with
         :meth:`call_on_close`, and exit all context managers entered
         with :meth:`with_resource`.
+
+        Every cleanup step runs even when another one fails. If one or
+        more steps fail, a :class:`~click.CleanupError` carrying all of
+        them is raised.
         """
         self._close_with_exception_info(None, None, None)
 
@@ -729,17 +844,78 @@ class Context:
         exc_value: BaseException | None,
         tb: TracebackType | None,
     ) -> bool | None:
-        """Unwind the exit stack by calling its :meth:`__exit__` providing the exception
-        information to allow for exception handling by the various resources registered
-        using :meth;`with_resource`
+        """Run every registered cleanup step in reverse registration order.
 
-        :return: Whatever ``exit_stack.__exit__()`` returns.
+        Each step receives the exception raised by the context body (if
+        any), so a resource's ``__exit__()`` can still return a truthy
+        value to handle it. A step that itself raises does not replace
+        the body exception or skip later steps: it is recorded as a
+        :class:`~click.CleanupFailure` with its source and command path,
+        and unwinding continues.
+
+        Aggregation:
+
+        - If the body exception is still active at the end, it is
+          re-raised as the primary conclusion and the cleanup failures
+          are attached to it in its ``cleanup_failures`` attribute.
+        - If the body finished normally (or a resource handled its
+          exception) but cleanup failed, a :class:`~click.CleanupError`
+          listing every failure is raised instead.
+        - Otherwise, this returns a truthy value only when a resource
+          handled the body exception, matching a ``with`` statement.
+
+        :return: ``True`` if a resource handled the body exception,
+            otherwise ``None``.
         """
-        exit_result = self._exit_stack.__exit__(exc_type, exc_value, tb)
-        # In case the context is reused, create a new exit stack.
-        self._exit_stack = ExitStack()
+        # Take ownership of the steps and reset immediately, so a reused
+        # context starts with a fresh registry even when unwinding raises.
+        entries = self._exit_stack.drain()
+        self._exit_stack = _CloseStack()
 
-        return exit_result
+        failures: list[CleanupFailure] = []
+        etype, evalue, etb = exc_type, exc_value, tb
+        suppressed = False
+
+        for entry in entries:
+            try:
+                if entry.exit(etype, evalue, etb):
+                    # A resource handled the in-flight exception; later
+                    # steps close as if the body had succeeded.
+                    etype, evalue, etb = None, None, None
+                    suppressed = True
+            except BaseException as e:
+                # Never let one cleanup failure take over the exception
+                # triple: later resources keep observing the body
+                # exception, and the failure is aggregated below.
+                failures.append(
+                    CleanupFailure(
+                        source=entry.source,
+                        command_path=self.command_path or None,
+                        exception=e,
+                    )
+                )
+
+        if evalue is not None:
+            if failures:
+                if isinstance(evalue, CleanupError):
+                    # The in-flight exception is already the cleanup phase's
+                    # conclusion from an inner context. Merge this level's
+                    # failures instead of presenting it as a body failure.
+                    _extend_cleanup_error(evalue, failures)
+                else:
+                    _record_cleanup_failures(evalue, failures)
+
+            # Re-raising the same object keeps it the primary conclusion
+            # without chaining a cleanup exception in front of it.
+            raise evalue
+
+        if failures:
+            # Chain from the first failure so the terminal traceback also
+            # shows where the cleanup itself failed; the full list stays
+            # available on the exception object.
+            raise CleanupError(tuple(failures)) from failures[0].exception
+
+        return True if suppressed else None
 
     @property
     def command_path(self) -> str:

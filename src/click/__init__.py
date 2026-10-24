@@ -31,6 +31,8 @@ from .exceptions import Abort as Abort
 from .exceptions import BadArgumentUsage as BadArgumentUsage
 from .exceptions import BadOptionUsage as BadOptionUsage
 from .exceptions import BadParameter as BadParameter
+from .exceptions import CleanupError as CleanupError
+from .exceptions import CleanupFailure as CleanupFailure
 from .exceptions import ClickException as ClickException
 from .exceptions import FileError as FileError
 from .exceptions import MissingParameter as MissingParameter

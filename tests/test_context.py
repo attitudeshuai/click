@@ -1,4 +1,5 @@
 import logging
+import typing as t
 from contextlib import AbstractContextManager
 from contextlib import contextmanager
 from types import TracebackType
@@ -658,6 +659,281 @@ def test_with_resource_nested_exception() -> None:
             TestContext(base_val=base_val_nested, handle_exception=False)
         )
         raise TestException()
+
+
+def _raise(exc: BaseException) -> None:
+    raise exc
+
+
+def test_close_single_failure_is_typed_and_attributed(runner) -> None:
+    @click.command()
+    @click.pass_context
+    def cli(ctx: Context) -> None:
+        ctx.call_on_close(lambda: _raise(ValueError("disk full")))
+
+    result = runner.invoke(cli, [])
+
+    assert isinstance(result.exception, click.CleanupError)
+    assert result.exit_code == 1
+    failure = result.exception.failures[0]
+    assert len(result.exception.failures) == 1
+    assert failure.exception_type == "ValueError"
+    assert failure.exception_message == "disk full"
+    assert failure.command_path == "cli"
+    assert "cli" in failure.source and "lambda" in failure.source
+    message = str(result.exception)
+    assert "while closing" in message
+    assert "disk full" in message
+    # The aggregated error chains from the original failure for tracebacks.
+    assert result.exception.__cause__ is failure.exception
+
+
+def test_close_failure_nonstandalone_matches_standalone(runner) -> None:
+    @click.command()
+    @click.pass_context
+    def cli(ctx: Context) -> None:
+        ctx.call_on_close(lambda: _raise(ValueError("disk full")))
+
+    result = runner.invoke(cli, [], standalone_mode=False)
+    assert isinstance(result.exception, click.CleanupError)
+    assert result.exception.failures[0].exception_message == "disk full"
+
+
+def test_close_runs_every_callback_and_lists_every_failure(runner) -> None:
+    ran: list[str] = []
+
+    def make_failing_callback(tag: str) -> t.Callable[[], None]:
+        def callback() -> None:
+            ran.append(tag)
+            raise RuntimeError(f"boom {tag}")
+
+        return callback
+
+    @click.command()
+    @click.pass_context
+    def cli(ctx: Context) -> None:
+        ctx.call_on_close(make_failing_callback("first"))
+        ctx.call_on_close(make_failing_callback("second"))
+        ctx.call_on_close(make_failing_callback("third"))
+
+    result = runner.invoke(cli, [])
+
+    # LIFO order is preserved, and one failure does not skip the rest.
+    assert ran == ["third", "second", "first"]
+    assert isinstance(result.exception, click.CleanupError)
+    failures = result.exception.failures
+    assert [f.exception_message for f in failures] == [
+        "boom third",
+        "boom second",
+        "boom first",
+    ]
+    assert {f.command_path for f in failures} == {"cli"}
+    assert all(f.exception_type == "RuntimeError" for f in failures)
+    assert "3 cleanup handlers failed" in str(result.exception)
+
+
+def test_close_failure_after_success_does_not_replace_business_exception() -> None:
+    class BusinessError(Exception):
+        pass
+
+    ctx = click.Context(click.Command("test"))
+
+    with pytest.raises(BusinessError) as exc_info:
+        with ctx.scope():
+            ctx.call_on_close(lambda: _raise(RuntimeError("cleanup boom")))
+            raise BusinessError("business boom")
+
+    exc = exc_info.value
+    # The body exception is the primary conclusion: its type is unchanged and
+    # no cleanup exception is chained in front of it.
+    assert str(exc) == "business boom"
+    assert exc.__context__ is None
+    (failure,) = exc.cleanup_failures
+    assert isinstance(failure, click.CleanupFailure)
+    assert failure.exception_message == "cleanup boom"
+    assert failure.exception_type == "RuntimeError"
+    # The context was created without an info name, so no command path is
+    # available; the callback identity still carries the attribution.
+    assert failure.command_path is None
+
+
+def test_close_failure_keeps_business_exception_through_runner(runner) -> None:
+    class BusinessError(Exception):
+        pass
+
+    @click.command()
+    @click.pass_context
+    def cli(ctx: Context) -> None:
+        ctx.call_on_close(lambda: _raise(ValueError("cleanup boom")))
+        raise BusinessError("business boom")
+
+    result = runner.invoke(cli, [])
+
+    assert type(result.exception) is BusinessError
+    (failure,) = result.exception.cleanup_failures
+    assert failure.command_path == "cli"
+    assert failure.exception_message == "cleanup boom"
+    assert not isinstance(result.exception, click.CleanupError)
+
+
+def test_close_failure_nested_contexts_attributed_inner_to_outer(runner) -> None:
+    class BusinessError(Exception):
+        pass
+
+    @click.group()
+    @click.pass_context
+    def cli(ctx: Context) -> None:
+        ctx.call_on_close(lambda: _raise(RuntimeError("outer cleanup")))
+
+    @cli.command()
+    @click.pass_context
+    def sub(ctx: Context) -> None:
+        ctx.call_on_close(lambda: _raise(RuntimeError("inner cleanup")))
+        raise BusinessError("from subcommand")
+
+    result = runner.invoke(cli, ["sub"])
+
+    assert type(result.exception) is BusinessError
+    failures = result.exception.cleanup_failures
+    assert [f.command_path for f in failures] == ["cli sub", "cli"]
+    assert [f.exception_message for f in failures] == [
+        "inner cleanup",
+        "outer cleanup",
+    ]
+
+
+def test_close_failure_nested_cleanup_only_merges_into_one_error(runner) -> None:
+    @click.group()
+    @click.pass_context
+    def cli(ctx: Context) -> None:
+        ctx.call_on_close(lambda: _raise(RuntimeError("outer cleanup")))
+
+    @cli.command()
+    @click.pass_context
+    def sub(ctx: Context) -> None:
+        ctx.call_on_close(lambda: _raise(RuntimeError("inner cleanup")))
+
+    result = runner.invoke(cli, ["sub"])
+
+    assert isinstance(result.exception, click.CleanupError)
+    failures = result.exception.failures
+    assert [f.command_path for f in failures] == ["cli sub", "cli"]
+    assert [f.exception_message for f in failures] == [
+        "inner cleanup",
+        "outer cleanup",
+    ]
+    assert "2 cleanup handlers failed" in str(result.exception)
+
+
+def test_close_method_raises_cleanup_error() -> None:
+    ctx = click.Context(click.Command("test"))
+    ctx.call_on_close(lambda: _raise(KeyError("missing")))
+
+    with pytest.raises(click.CleanupError) as exc_info:
+        ctx.close()
+
+    (failure,) = exc_info.value.failures
+    assert failure.exception_type == "KeyError"
+    assert failure.command_path is None
+    assert "lambda" in failure.source
+
+
+def test_close_resource_failure_is_attributed_as_resource() -> None:
+    class BrokenResource(AbstractContextManager[None]):
+        name = "artifact.bin"
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *exc: object) -> bool | None:
+            raise OSError("cannot flush")
+
+    ctx = click.Context(click.Command("test"))
+    ctx.with_resource(BrokenResource())
+
+    with pytest.raises(click.CleanupError) as exc_info:
+        ctx.close()
+
+    (failure,) = exc_info.value.failures
+    assert "BrokenResource" in failure.source
+    assert "artifact.bin" in failure.source
+    assert failure.exception_type == "OSError"
+    assert failure.exception_message == "cannot flush"
+
+
+def test_close_resource_failure_attaches_to_business_exception() -> None:
+    class BusinessError(Exception):
+        pass
+
+    class BrokenResource(AbstractContextManager[None]):
+        seen_exc: BaseException | None = None
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, et, exc, tb) -> bool | None:
+            # The resource still observes the body exception, not another
+            # resource's cleanup failure.
+            BrokenResource.seen_exc = exc
+            raise OSError("exit failed")
+
+    ctx = click.Context(click.Command("test"))
+
+    with pytest.raises(BusinessError) as exc_info:
+        with ctx.scope():
+            ctx.with_resource(BrokenResource())
+            raise BusinessError("body failed")
+
+    assert isinstance(BrokenResource.seen_exc, BusinessError)
+    (failure,) = exc_info.value.cleanup_failures
+    assert failure.exception_type == "OSError"
+    assert "BrokenResource" in failure.source
+
+
+def test_failed_close_pops_context_and_leaves_reusable_stack(runner) -> None:
+    seen: list[str] = []
+
+    @click.command()
+    @click.pass_context
+    def cli(ctx: Context) -> None:
+        def failing_callback() -> None:
+            # The context is still the current one while the callback runs.
+            seen.append(click.get_current_context().command.name)
+            raise RuntimeError("boom")
+
+        ctx.call_on_close(failing_callback)
+
+    result = runner.invoke(cli, [])
+    assert isinstance(result.exception, click.CleanupError)
+    assert seen == ["cli"]
+    # A failed close must not leave its context on the thread-local stack.
+    assert click.get_current_context(silent=True) is None
+
+    # A context is reusable after a failed close: the registry was reset.
+    ctx = click.Context(click.Command("test"))
+    ran: list[str] = []
+    ctx.call_on_close(lambda: (_ for _ in ()).throw(RuntimeError("first")))
+    with pytest.raises(click.CleanupError):
+        ctx.close()
+    ctx.call_on_close(lambda: ran.append("second"))
+    ctx.close()
+    assert ran == ["second"]
+
+
+def test_close_failure_with_bound_callback_uses_qualified_name() -> None:
+    class Service:
+        def shutdown(self) -> None:
+            raise RuntimeError("shutdown failed")
+
+    service = Service()
+    ctx = click.Context(click.Command("test"))
+    ctx.call_on_close(service.shutdown)
+
+    with pytest.raises(click.CleanupError) as exc_info:
+        ctx.close()
+
+    (failure,) = exc_info.value.failures
+    assert "Service.shutdown" in failure.source
 
 
 def test_make_pass_decorator_args(runner):

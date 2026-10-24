@@ -8,6 +8,9 @@ composable.
 from __future__ import annotations
 
 from .core import Argument as Argument
+from .core import ChainFailurePolicy as ChainFailurePolicy
+from .core import ChainResult as ChainResult
+from .core import ChainResultStatus as ChainResultStatus
 from .core import Command as Command
 from .core import CommandCollection as CommandCollection
 from .core import Context as Context

@@ -167,6 +167,23 @@ classes and functions.
 ```
 
 ```{eval-rst}
+.. autoclass:: ChainFailurePolicy
+   :members:
+   :member-order: bysource
+```
+
+```{eval-rst}
+.. autoclass:: ChainResultStatus
+   :members:
+   :member-order: bysource
+```
+
+```{eval-rst}
+.. autoclass:: ChainResult
+   :members:
+```
+
+```{eval-rst}
 .. autoclass:: CommandCollection
    :members:
 ```

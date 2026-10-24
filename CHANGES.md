@@ -2,6 +2,15 @@
 
 Unreleased
 
+- A chained {class}`Group` accepts a `chain_failure_policy` argument, a
+  {class}`ChainFailurePolicy` value, to configure what happens when a
+  subcommand raises an exception: `abort` (the default, unchanged behavior),
+  `skip_remaining`, and `continue`. A result callback registered with
+  `outcomes=True` receives a list of {class}`ChainResult` objects, each with
+  the subcommand name, a {class}`ChainResultStatus` (`success`, `failure`,
+  `skipped`, or `not_run`), the return value, and the original exception. The
+  historical callback that reads the list of return values continues to work,
+  and non-chained groups are unchanged.
 - A parameter name that is not a valid Python identifier, or that is a Python
   keyword, is deprecated and raises `TypeError` in Click 9.0. {pr}`3866`
 - An {class}`Option` name written as a Python identifier is deprecated when it

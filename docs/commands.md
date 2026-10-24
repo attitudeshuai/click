@@ -291,6 +291,89 @@ see the [imagepipe example](https://github.com/pallets/click/tree/main/examples/
 in the Click repository. It implements a pipeline based image editing tool
 that has a nice internal structure.
 
+(chain-failure-policy)=
+
+## Handling Chained Command Failures
+
+By default, an exception raised by a chained subcommand stops the whole chain:
+the exception propagates unchanged, the remaining commands never run, and the
+result callback is not invoked. This is the `ChainFailurePolicy.ABORT` policy
+and remains the default.
+
+When every subcommand is an independent task, it can be preferable to keep
+going and review what happened afterwards. Pass the `chain_failure_policy`
+argument when creating the group. The policy is a configuration option, not a
+command line argument, and is only valid with `chain=True`.
+
+- `ChainFailurePolicy.ABORT` (`"abort"`) — stop at the first failure and raise
+  the original exception. This is the default and the historical behavior.
+- `ChainFailurePolicy.SKIP_REMAINING` (`"skip_remaining"`) — record the
+  failure and do not invoke any of the remaining commands.
+- `ChainFailurePolicy.CONTINUE` (`"continue"`) — invoke every command in
+  order and record every failure.
+
+To inspect what happened, register the result callback with `outcomes=True`.
+It is then passed a list of {class}`~click.ChainResult` objects instead of the
+list of return values. Each object has the subcommand's `name`, a `status`
+from {class}`~click.ChainResultStatus`, the returned `value`, and the original
+`exception` for a failed command.
+
+```python
+@click.group(
+    chain=True, chain_failure_policy=click.ChainFailurePolicy.CONTINUE
+)
+def cli():
+    pass
+
+@cli.command("a")
+def a():
+    return 1
+
+@cli.command("b")
+def b():
+    raise RuntimeError("b failed")
+
+@cli.command("c")
+def c():
+    return 3
+
+@cli.result_callback(outcomes=True)
+def process_results(results):
+    for result in results:
+        if result.status is click.ChainResultStatus.SUCCESS:
+            click.echo(f"{result.name}: {result.value}")
+        elif result.status is click.ChainResultStatus.FAILURE:
+            click.echo(f"{result.name}: {result.exception}")
+```
+
+`a b c` runs all three commands and prints each conclusion. The status is one
+of `"success"`, `"failure"`, `"skipped"`, or `"not_run"`:
+
+- A successful command has status `"success"` and its return value in
+  `value`.
+- A failed command has status `"failure"` and the original, unchanged
+  exception in `exception`. The exception type and message are not rewritten.
+- Under `SKIP_REMAINING`, every command after the failure has status
+  `"skipped"`.
+- Under the default `ABORT` policy, commands after the failure have status
+  `"not_run"`; a result callback with `outcomes=True` receives the partial
+  list before the original exception propagates.
+
+Skipped and not-run commands are never invoked, have no side effects, and do
+not become the current context. Resources their contexts acquired while
+parsing are still released. Commands that did run have their cleanup callbacks
+executed normally, whether they succeeded or failed. After the chain
+finishes, the exit code is `1` if any command failed under a non-aborting
+policy.
+
+A result callback registered without `outcomes=True` keeps the historical
+calling convention: it receives a list of return values, with `None` for
+commands that did not succeed. Other behavior is unchanged: with no
+subcommand, `no_args_is_help` shows the help and an
+`invoke_without_command=True` group still invokes the result callback with an
+empty list. The policy does not cover the group's own callback, errors while
+parsing the subcommands, or non-chained groups.
+
 ## Overriding Defaults
 
 By default, the default value for a parameter is pulled from the

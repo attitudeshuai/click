@@ -1700,6 +1700,105 @@ class _BaseCommand(Command, metaclass=_FakeSubclassCheck):
     """
 
 
+class ChainFailurePolicy(str, enum.Enum):
+    """What a chained :class:`Group` does when one of its subcommands raises
+    an exception while the chain is invoked.
+
+    The members are also strings, so the policy can be passed by name, for
+    example ``chain_failure_policy="continue"``.
+
+    .. versionadded:: 8.6
+    """
+
+    ABORT = "abort"
+    """Stop the chain at the first failure and raise the exception. This is
+    the default and matches the historical behavior."""
+
+    SKIP_REMAINING = "skip_remaining"
+    """Record the failure and do not invoke any of the remaining commands.
+    They are reported as :attr:`ChainResultStatus.SKIPPED`."""
+
+    CONTINUE = "continue"
+    """Invoke every command in order. Each failure is recorded instead of
+    being raised."""
+
+
+class ChainResultStatus(str, enum.Enum):
+    """The conclusion of a single subcommand in a chained :class:`Group`.
+
+    The members are also strings.
+
+    .. versionadded:: 8.6
+    """
+
+    SUCCESS = "success"
+    """The command was invoked and returned normally."""
+
+    FAILURE = "failure"
+    """The command was invoked and raised an exception."""
+
+    SKIPPED = "skipped"
+    """The command was not invoked because a failure policy skipped it after
+    an earlier failure."""
+
+    NOT_RUN = "not_run"
+    """The command's turn never came, for a reason other than a policy
+    decision, such as the default abort policy stopping the chain."""
+
+
+class ChainResult:
+    """The conclusion of a single subcommand in a chained :class:`Group`.
+
+    A list of these objects is passed to a result callback registered with
+    ``outcomes=True``. Only the attributes relevant to :attr:`status` are
+    populated: :attr:`value` for a successful command and :attr:`exception`
+    for a failed command.
+
+    :param name: The name used to invoke the subcommand.
+    :param status: The conclusion of the subcommand.
+    :param value: The value returned by the subcommand, if it succeeded.
+    :param exception: The original exception raised by the subcommand, if it
+        failed. The exception is never wrapped or rewritten.
+
+    .. versionadded:: 8.6
+    """
+
+    __slots__ = ("name", "status", "value", "exception")
+
+    name: str
+    status: ChainResultStatus
+    value: t.Any
+    exception: BaseException | None
+
+    def __init__(
+        self,
+        name: str,
+        status: ChainResultStatus,
+        *,
+        value: t.Any = None,
+        exception: BaseException | None = None,
+    ) -> None:
+        self.name = name
+        self.status = status
+        self.value = value
+        self.exception = exception
+
+    @property
+    def ok(self) -> bool:
+        """``True`` if the subcommand succeeded."""
+        return self.status is ChainResultStatus.SUCCESS
+
+    def __repr__(self) -> str:
+        if self.status is ChainResultStatus.SUCCESS:
+            detail = f"value={self.value!r}"
+        elif self.status is ChainResultStatus.FAILURE:
+            detail = f"exception={self.exception!r}"
+        else:
+            detail = ""
+
+        return f"<ChainResult {self.name!r} {self.status.value} {detail}>".rstrip()
+
+
 class Group(Command):
     """A group is a command that nests other commands (or more groups).
 
@@ -1721,7 +1820,21 @@ class Group(Command):
         all the commands. If ``invoke_without_command`` is enabled, the value
         will be the value returned by the group's callback, or an empty list if
         ``chain`` is enabled.
+    :param chain_failure_policy: What to do when a subcommand of a chained
+        group raises an exception. A member of :class:`ChainFailurePolicy` or
+        its string value. Defaults to
+        :attr:`ChainFailurePolicy.ABORT`, which stops the chain and raises the
+        exception, matching the historical behavior.
+        :attr:`ChainFailurePolicy.SKIP_REMAINING` records the failure and
+        skips the remaining commands, and
+        :attr:`ChainFailurePolicy.CONTINUE` invokes every command and records
+        every failure. Only valid when ``chain`` is enabled. Register the
+        result callback with ``outcomes=True`` to receive a list of
+        :class:`ChainResult` objects instead of the list of return values.
     :param kwargs: Other arguments passed to :class:`Command`.
+
+    .. versionchanged:: 8.6
+        Added the ``chain_failure_policy`` parameter.
 
     .. versionchanged:: 8.0
         The ``commands`` argument can be a list of command objects.
@@ -1757,7 +1870,9 @@ class Group(Command):
     invoke_without_command: bool
     subcommand_metavar: str
     chain: bool
+    chain_failure_policy: ChainFailurePolicy
     _result_callback: t.Callable[..., t.Any] | None
+    _result_callback_outcomes: bool
 
     def __init__(
         self,
@@ -1770,9 +1885,26 @@ class Group(Command):
         subcommand_metavar: str | None = None,
         chain: bool = False,
         result_callback: t.Callable[..., t.Any] | None = None,
+        chain_failure_policy: ChainFailurePolicy | str = ChainFailurePolicy.ABORT,
         **kwargs: t.Any,
     ) -> None:
         super().__init__(name, **kwargs)
+
+        if not isinstance(chain_failure_policy, ChainFailurePolicy):
+            try:
+                chain_failure_policy = ChainFailurePolicy(chain_failure_policy)
+            except ValueError:
+                allowed = ", ".join(repr(policy.value) for policy in ChainFailurePolicy)
+                raise ValueError(
+                    "'chain_failure_policy' must be one of"
+                    f" {allowed}, got {chain_failure_policy!r}."
+                ) from None
+
+        if not chain and chain_failure_policy is not ChainFailurePolicy.ABORT:
+            raise RuntimeError(
+                "'chain_failure_policy' can only be configured for a group in"
+                " chain mode ('chain=True')."
+            )
 
         if commands is None:
             commands = {}
@@ -1803,9 +1935,13 @@ class Group(Command):
 
         self.subcommand_metavar = subcommand_metavar
         self.chain = chain
+        self.chain_failure_policy = chain_failure_policy
         # The result callback that is stored. This can be set or
         # overridden with the :func:`result_callback` decorator.
         self._result_callback = result_callback
+        # Whether the stored result callback expects a list of
+        # ChainResult objects instead of the plain list of return values.
+        self._result_callback_outcomes = False
 
         if self.chain:
             for param in self.params:
@@ -1943,7 +2079,9 @@ class Group(Command):
 
         return decorator
 
-    def result_callback(self, replace: bool = False) -> t.Callable[[F], F]:
+    def result_callback(
+        self, replace: bool = False, *, outcomes: bool = False
+    ) -> t.Callable[[F], F]:
         """Adds a result callback to the command.  By default if a
         result callback is already registered this will chain them but
         this can be disabled with the `replace` parameter.  The result
@@ -1965,6 +2103,16 @@ class Group(Command):
 
         :param replace: if set to `True` an already existing result
                         callback will be removed.
+        :param outcomes: for a chained group, pass a list of
+            :class:`ChainResult` objects instead of the list of return
+            values. Each object carries the subcommand name, its
+            :class:`ChainResultStatus`, the return value, and the
+            original exception for a failed command. This is required to
+            observe failures recorded by ``chain_failure_policy``. It has
+            no effect when the group is not chained.
+
+        .. versionchanged:: 8.6
+            Added the ``outcomes`` parameter.
 
         .. versionchanged:: 8.0
             Renamed from ``resultcallback``.
@@ -1977,6 +2125,7 @@ class Group(Command):
 
             if old_callback is None or replace:
                 self._result_callback = f
+                self._result_callback_outcomes = outcomes
                 return f
 
             def function(value: t.Any, /, *args: t.Any, **kwargs: t.Any) -> t.Any:
@@ -2096,11 +2245,14 @@ class Group(Command):
 
             # Otherwise we make every single context and invoke them in a
             # chain.  In that case the return value to the result processor
-            # is the list of all invoked subcommand's results.
-            contexts = []
+            # is the list of all invoked subcommand's results. The contexts
+            # are all created before any of them is invoked; that is not
+            # affected by the failure policy.
+            contexts: list[tuple[str, Context]] = []
             while args:
                 cmd_name, cmd, args = self.resolve_command(ctx, args)
                 assert cmd is not None
+                assert cmd_name is not None
                 sub_ctx = cmd.make_context(
                     cmd_name,
                     args,
@@ -2108,14 +2260,109 @@ class Group(Command):
                     allow_extra_args=True,
                     allow_interspersed_args=False,
                 )
-                contexts.append(sub_ctx)
+                contexts.append((cmd_name, sub_ctx))
                 args, sub_ctx.args = sub_ctx.args, []
 
-            rv = []
-            for sub_ctx in contexts:
-                with sub_ctx:
-                    rv.append(sub_ctx.command.invoke(sub_ctx))
-            return _process_result(rv)
+            return self._invoke_chain(ctx, contexts, _process_result)
+
+    def _invoke_chain(
+        self,
+        ctx: Context,
+        contexts: cabc.Sequence[tuple[str, Context]],
+        process_result: cabc.Callable[[t.Any], t.Any],
+    ) -> t.Any:
+        """Invoke the pre-built ``contexts`` of a chained group in order.
+
+        ``process_result`` invokes the group's result callback with the
+        final value.
+        """
+        policy = self.chain_failure_policy
+        outcomes: list[ChainResult] = []
+        skipping = False
+        # Index of the next context not yet handled. The ``finally`` block
+        # closes any contexts left over when invocation unwinds early.
+        next_index = 0
+
+        try:
+            for next_index, (cmd_name, sub_ctx) in enumerate(contexts, start=1):
+                if skipping:
+                    # An earlier command failed under SKIP_REMAINING. The
+                    # command is neither invoked nor pushed as the current
+                    # context, but its context may hold resources acquired
+                    # while parsing (such as open files), so close it.
+                    outcomes.append(
+                        ChainResult(cmd_name, ChainResultStatus.SKIPPED)
+                    )
+                    sub_ctx.close()
+                    continue
+
+                try:
+                    with sub_ctx:
+                        value = sub_ctx.command.invoke(sub_ctx)
+                except (Exit, Abort):
+                    # Control-flow signals rather than command failures, so
+                    # the failure policy never intercepts them.
+                    raise
+                except Exception as e:
+                    outcomes.append(
+                        ChainResult(
+                            cmd_name, ChainResultStatus.FAILURE, exception=e
+                        )
+                    )
+
+                    if policy is ChainFailurePolicy.ABORT:
+                        # Keep the historical behavior: the chain stops and
+                        # the original exception is raised unchanged. Record
+                        # the remaining commands for a result callback that
+                        # opted into outcomes.
+                        for later_name, _ in contexts[next_index:]:
+                            outcomes.append(
+                                ChainResult(
+                                    later_name, ChainResultStatus.NOT_RUN
+                                )
+                            )
+
+                        if self._result_callback_outcomes:
+                            process_result(outcomes)
+
+                        raise
+
+                    if policy is ChainFailurePolicy.SKIP_REMAINING:
+                        skipping = True
+                else:
+                    outcomes.append(
+                        ChainResult(
+                            cmd_name, ChainResultStatus.SUCCESS, value=value
+                        )
+                    )
+
+            result_value = (
+                outcomes
+                if self._result_callback_outcomes
+                else [
+                    result.value
+                    if result.status is ChainResultStatus.SUCCESS
+                    else None
+                    for result in outcomes
+                ]
+            )
+            rv = process_result(result_value)
+
+            if any(
+                result.status is ChainResultStatus.FAILURE for result in outcomes
+            ):
+                # Failures were recorded and handled instead of being raised
+                # per command, but the process must still report that at
+                # least one command failed.
+                ctx.exit(1)
+
+            return rv
+        finally:
+            # Reclaim contexts of commands whose turn never came. Contexts
+            # of commands that ran or were skipped are already closed, and
+            # closing a context twice is harmless.
+            for _, sub_ctx in contexts[next_index:]:
+                sub_ctx.close()
 
     def resolve_command(
         self, ctx: Context, args: list[str]

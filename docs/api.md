@@ -171,6 +171,22 @@ classes and functions.
    :members:
 ```
 
+### Configuration Check
+
+```{eval-rst}
+.. autofunction:: check_command
+```
+
+```{eval-rst}
+.. autoclass:: ConfigIssue
+   :members:
+```
+
+```{eval-rst}
+.. autoclass:: ConfigCheckError
+   :members:
+```
+
 ## Parameters
 
 ```{eval-rst}

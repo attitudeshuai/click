@@ -51,6 +51,7 @@ from .utils import make_str
 if t.TYPE_CHECKING:
     from typing_extensions import Self
 
+    from .checking import ConfigIssue
     from .shell_completion import CompletionItem
 
 F = t.TypeVar("F", bound="t.Callable[..., t.Any]")
@@ -1116,6 +1117,32 @@ class Command:
             "hidden": self.hidden,
             "deprecated": self.deprecated,
         }
+
+    def check(
+        self,
+        default_map: t.Any = UNSET,
+        *,
+        strict: bool = False,
+        file: t.IO[str] | None = None,
+    ) -> list[ConfigIssue]:
+        """Check this command tree's ``default_map`` and
+        ``context_settings`` keys without parsing anything.
+
+        See :func:`click.check_command` for the full description. This is a
+        convenience wrapper that checks the tree rooted at this command.
+
+        :param default_map: Default map for the root command. When omitted,
+            the ``default_map`` entry of this command's
+            ``context_settings`` is used, if any.
+        :param strict: Print a report when ``False`` (the default), or raise
+            :class:`~click.ConfigCheckError` when ``True``.
+        :param file: Stream the advisory report is written to.
+
+        .. versionadded:: 8.6.0
+        """
+        from .checking import check_command
+
+        return check_command(self, default_map=default_map, strict=strict, file=file)
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} {self.name}>"

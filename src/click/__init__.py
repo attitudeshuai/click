@@ -7,6 +7,9 @@ composable.
 
 from __future__ import annotations
 
+from .checking import check_command as check_command
+from .checking import ConfigCheckError as ConfigCheckError
+from .checking import ConfigIssue as ConfigIssue
 from .core import Argument as Argument
 from .core import Command as Command
 from .core import CommandCollection as CommandCollection

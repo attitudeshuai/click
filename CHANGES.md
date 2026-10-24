@@ -2,6 +2,14 @@
 
 Unreleased
 
+- Add {func}`check_command` and {meth}`Command.check`, an independent entry
+  point that walks a command tree and reports every unconsumed
+  `default_map` key, nested `default_map` table placed at the wrong command
+  level, and `context_settings` key the command's context class does not
+  accept. Each report item carries the command path and key name; advisory
+  mode prints the report, strict mode raises {class}`ConfigCheckError`.
+  Parsing, `default_map` precedence, and `context_settings` forwarding are
+  unchanged.
 - A parameter name that is not a valid Python identifier, or that is a Python
   keyword, is deprecated and raises `TypeError` in Click 9.0. {pr}`3866`
 - An {class}`Option` name written as a Python identifier is deprecated when it

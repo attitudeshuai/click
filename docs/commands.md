@@ -420,6 +420,42 @@ And again the example in action:
     invoke(cli, prog_name='cli', args=['runserver'])
 ```
 
+### Checking Default Maps and Context Settings
+
+```{versionadded} 8.6.0
+```
+
+A misspelled `default_map` key is silently ignored, and a misspelled
+`context_settings` key only shows up as a `TypeError` when the command runs,
+with no indication of which command owns it. {func}`check_command` is an
+independent entry point that walks the current command tree and reports every
+such key before parsing happens.
+
+For each command the legal keys are the names of its parameters, the names of
+its subcommands (for nested `default_map` tables), and the keyword parameters
+accepted by its context class (for `context_settings`). Every unconsumed
+`default_map` key, every nested table placed at the wrong level, and every
+unknown `context_settings` key is reported with its command path and key name.
+Dynamically registered commands and the flattened tree of a
+{class}`CommandCollection` are seen in the shape they have when the check is
+called.
+
+By default the report is printed to standard error and returned as a list of
+{class}`ConfigIssue` objects; an empty list means the configuration is valid
+and nothing is printed. Pass `strict=True` to raise a
+{class}`ConfigCheckError` holding the same report instead. {meth}`Command.check`
+is the equivalent method on a command.
+
+```python
+
+    issues = click.check_command(cli, default_map=default_map)
+    cli.check(strict=True)  # or, at application startup
+```
+
+The check validates keys only; `default_map` values are not inspected,
+precedence and inheritance are unchanged, and the normal parsing path is not
+affected.
+
 ## Command Return Values
 
 ```{versionadded} 3.0

@@ -2,6 +2,15 @@
 
 Unreleased
 
+- {class}`~click.testing.CliRunner` gains opt-in process-state leak detection.
+  With `detect_leaks=True`, each invocation snapshots the environment, working
+  directory, `logging` configuration, `warnings.filters`, `sys.modules` and
+  Click's context stack, and attaches a {class}`~click.testing.LeakReport`
+  listing every added, removed or changed value to
+  {attr}`~click.testing.Result.leak_report`. `raise_on_leak` raises
+  {class}`~click.testing.LeakError` on a non-empty report, `restore_leaks`
+  restores entry state, and `watch_env` / `watch_globals` extend the watch
+  list. Detection is off by default and adds no overhead when disabled.
 - A parameter name that is not a valid Python identifier, or that is a Python
   keyword, is deprecated and raises `TypeError` in Click 9.0. {pr}`3866`
 - An {class}`Option` name written as a Python identifier is deprecated when it

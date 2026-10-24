@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import collections.abc as cabc
 import contextlib
+import importlib
 import io
+import logging
 import os
 import pdb
 import shlex
 import sys
 import tempfile
 import typing as t
+import warnings
 from types import TracebackType
 
 from . import _compat
 from . import formatting
+from . import globals as click_globals
 from . import termui
 from . import utils
 from ._compat import _find_binary_reader
@@ -228,6 +232,569 @@ def make_input_stream(
     return io.BytesIO(input)
 
 
+# ---------------------------------------------------------------------------
+# Process state leak detection
+# ---------------------------------------------------------------------------
+
+LeakChange: t.TypeAlias = t.Literal["added", "removed", "changed"]
+
+
+class _Absent:
+    """Singleton standing in for a value that did not exist on one side of
+    a leak comparison, such as a deleted environment variable.
+    """
+
+    _instance: _Absent | None = None
+
+    def __new__(cls) -> _Absent:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "<absent>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+#: Placeholder for a value missing before (``added``) or after (``removed``)
+#: an invocation.
+ABSENT: t.Final[_Absent] = _Absent()
+
+#: Modules Click may import lazily while running a command. They are imported
+#: before the snapshot so the runner itself does not show up as a
+#: ``sys.modules`` leak.
+_PREWARM_MODULES: tuple[str, ...] = (
+    "copy",
+    "difflib",
+    "errno",
+    "getpass",
+    "glob",
+    "importlib.metadata",
+    "keyword",
+    "locale",
+    "logging",
+    "operator",
+    "random",
+    "shutil",
+    "subprocess",
+    "tempfile",
+    "textwrap",
+    "warnings",
+    "webbrowser",
+    "click.shell_completion",
+)
+
+
+def _prewarm_modules() -> None:
+    """Import the modules Click may load lazily during an invocation.
+
+    This keeps the runner's own lazy imports out of ``sys.modules`` leak
+    reports. Platform-specific modules are imported on a best-effort basis.
+    """
+    names = [*_PREWARM_MODULES, "msvcrt" if sys.platform == "win32" else "termios"]
+
+    if sys.platform != "win32":
+        names.append("tty")
+
+    for name in names:
+        try:
+            importlib.import_module(name)
+        except Exception:
+            pass
+
+
+def _format_value(value: t.Any, max_length: int = 200) -> str:
+    """Render a snapshot value for human-readable leak reports."""
+    if value is ABSENT:
+        return repr(ABSENT)
+
+    try:
+        rendered = repr(value)
+    except Exception as e:
+        rendered = f"<unreprable {type(value).__name__}: {e}>"
+
+    if len(rendered) > max_length:
+        rendered = f"{rendered[: max_length - 16]}...<truncated>"
+
+    return rendered
+
+
+class LeakItem:
+    """A single process-state change left behind after an invocation.
+
+    :param name: What changed, for example ``"os.environ['FOO']"``.
+    :param before: The value before the invocation. :data:`ABSENT` means the
+        name did not exist yet.
+    :param after: The value after the invocation. :data:`ABSENT` means it was
+        removed.
+    :param change: One of ``"added"``, ``"removed"`` or ``"changed"``.
+
+    .. versionadded:: 8.6
+    """
+
+    name: str
+    before: t.Any
+    after: t.Any
+    change: LeakChange
+
+    def __init__(
+        self, name: str, before: t.Any, after: t.Any, change: LeakChange
+    ) -> None:
+        self.name = name
+        self.before = before
+        self.after = after
+        self.change = change
+
+    @property
+    def added(self) -> bool:
+        """Whether this item did not exist before the invocation."""
+        return self.change == "added"
+
+    @property
+    def removed(self) -> bool:
+        """Whether this item no longer exists after the invocation."""
+        return self.change == "removed"
+
+    @property
+    def changed(self) -> bool:
+        """Whether this item existed on both sides with different values."""
+        return self.change == "changed"
+
+    def __str__(self) -> str:
+        return (
+            f"{self.change:>7}: {self.name}:"
+            f" {_format_value(self.before)} -> {_format_value(self.after)}"
+        )
+
+    def __repr__(self) -> str:
+        return f"<LeakItem {self.change} {self.name}>"
+
+
+class LeakReport:
+    """The process-state differences left after a :meth:`CliRunner.invoke`.
+
+    Iterating yields :class:`LeakItem` instances. A report is falsy when no
+    leaks were detected.
+
+    .. versionadded:: 8.6
+    """
+
+    items: tuple[LeakItem, ...]
+
+    def __init__(self, items: cabc.Iterable[LeakItem] = ()) -> None:
+        self.items = tuple(items)
+
+    @property
+    def added(self) -> list[LeakItem]:
+        """Names created during the invocation and not removed again."""
+        return [item for item in self.items if item.added]
+
+    @property
+    def removed(self) -> list[LeakItem]:
+        """Names deleted during the invocation."""
+        return [item for item in self.items if item.removed]
+
+    @property
+    def changed(self) -> list[LeakItem]:
+        """Names whose values differ before and after the invocation."""
+        return [item for item in self.items if item.changed]
+
+    def __bool__(self) -> bool:
+        return bool(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __iter__(self) -> cabc.Iterator[LeakItem]:
+        return iter(self.items)
+
+    def __getitem__(self, index: int | slice) -> t.Any:
+        return self.items[index]
+
+    def __str__(self) -> str:
+        if not self.items:
+            return "No process state leaks detected."
+
+        lines = [
+            f"Process state leaked during CliRunner.invoke ({len(self.items)} item(s)):"
+        ]
+        lines.extend(f"  {item}" for item in self.items)
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return f"<LeakReport ({len(self.items)} item(s))>"
+
+
+class LeakError(AssertionError):
+    """Raised when leak detection is enabled with ``raise_on_leak`` and a
+    :class:`LeakReport` is not empty.
+
+    The full report is available as :attr:`report` and in the exception
+    message.
+
+    .. versionadded:: 8.6
+    """
+
+    report: LeakReport
+
+    def __init__(self, report: LeakReport) -> None:
+        self.report = report
+        super().__init__(str(report))
+
+
+class GlobalWatch:
+    """Watch one attribute on a global object for process-state leaks.
+
+    :param obj: The object or module owning the attribute, for example an
+        imported configuration module.
+    :param attr: The attribute name to snapshot before and after an
+        invocation.
+    :param copier: Optional callable returning an independent copy of the
+        value. Required to detect in-place mutation of mutable values such as
+        lists or dicts (for example ``list`` or ``dict.copy``). When not
+        given, plain equality is used, which detects reassignment but not
+        in-place changes.
+
+    Register watches through the ``watch_globals`` mapping of
+    :class:`CliRunner` or by appending to :attr:`CliRunner.watch_globals`.
+
+    .. versionadded:: 8.6
+    """
+
+    obj: t.Any
+    attr: str
+    copier: t.Callable[[t.Any], t.Any] | None
+
+    def __init__(
+        self,
+        obj: t.Any,
+        attr: str,
+        copier: t.Callable[[t.Any], t.Any] | None = None,
+    ) -> None:
+        self.obj = obj
+        self.attr = attr
+        self.copier = copier
+
+
+class _Watchpoint:
+    """One named piece of process state that can leak between invocations."""
+
+    name: str
+
+    def snapshot(self) -> t.Any:
+        raise NotImplementedError
+
+    def snapshot_inside(self) -> t.Any:
+        """Snapshot taken after isolation applied its own overrides.
+
+        Only the environment watchpoint uses this: it lets explicitly
+        watched keys be tracked even when the runner itself overrides them.
+        """
+        return None
+
+    def diff(self, before: t.Any, after: t.Any) -> list[LeakItem]:
+        try:
+            equal = before == after
+        except Exception:
+            equal = before is after
+
+        if equal:
+            return []
+
+        return [LeakItem(self.name, before, after, "changed")]
+
+    def diff_inside(self, inside_before: t.Any, inside_after: t.Any) -> list[LeakItem]:
+        """Compare snapshots taken inside isolation.
+
+        Only the environment watchpoint uses this, for explicitly watched
+        keys that the runner itself overrides.
+        """
+        return []
+
+    def restore(self, before: t.Any) -> None:
+        """Best-effort restoration of the entry snapshot. Only called when
+        the runner is configured to restore leaks."""
+
+
+class _EnvironWatchpoint(_Watchpoint):
+    """Compare every process environment variable.
+
+    Keys the runner overrides through its own isolation are ignored by
+    default, since isolation restores them itself. Explicitly registered
+    ``extra_keys`` are additionally tracked inside isolation, so a command
+    mutating a value the runner overwrote is still reported.
+    """
+
+    name = "os.environ"
+
+    def __init__(
+        self,
+        ignored_keys: cabc.Collection[str] = (),
+        extra_keys: cabc.Collection[str] = (),
+    ) -> None:
+        self.ignored_keys = set(ignored_keys)
+        self.extra_keys = set(extra_keys)
+
+    @property
+    def _tracked_overrides(self) -> set[str]:
+        """Overridden keys the caller explicitly asked to watch."""
+        return self.ignored_keys & self.extra_keys
+
+    def snapshot(self) -> dict[str, str]:
+        return dict(os.environ)
+
+    def snapshot_inside(self) -> dict[str, str | _Absent]:
+        return {
+            key: os.environ[key] if key in os.environ else ABSENT
+            for key in self._tracked_overrides
+        }
+
+    def diff(self, before: dict[str, str], after: dict[str, str]) -> list[LeakItem]:
+        items: list[LeakItem] = []
+
+        # Everything the command leaves in the process environment, except
+        # keys isolation owns and restores itself.
+        for key in sorted((before.keys() | after.keys()) - self.ignored_keys):
+            label = f"os.environ[{key!r}]"
+            existed_before = key in before
+            exists_after = key in after
+
+            if existed_before and exists_after:
+                if before[key] != after[key]:
+                    items.append(LeakItem(label, before[key], after[key], "changed"))
+            elif exists_after:
+                items.append(LeakItem(label, ABSENT, after[key], "added"))
+            else:
+                items.append(LeakItem(label, before[key], ABSENT, "removed"))
+
+        return items
+
+    def diff_inside(
+        self,
+        inside_before: dict[str, str | _Absent],
+        inside_after: dict[str, str | _Absent],
+    ) -> list[LeakItem]:
+        # Explicitly watched keys that the runner overrides through
+        # isolation: compare the values the command actually saw.
+        items: list[LeakItem] = []
+
+        for key in sorted(self._tracked_overrides):
+            old = inside_before.get(key, ABSENT)
+            new = inside_after.get(key, ABSENT)
+
+            if old != new:
+                items.append(LeakItem(f"os.environ[{key!r}]", old, new, "changed"))
+
+        return items
+
+    def restore(self, before: dict[str, str]) -> None:
+        for key, value in before.items():
+            if os.environ.get(key) != value:
+                os.environ[key] = value
+
+        for key in list(os.environ):
+            if key not in before:
+                try:
+                    del os.environ[key]
+                except OSError:
+                    pass
+
+
+class _CwdWatchpoint(_Watchpoint):
+    name = "os.getcwd()"
+
+    def snapshot(self) -> str | _Absent:
+        try:
+            return os.getcwd()
+        except OSError:
+            # The current directory may have been removed under us.
+            return ABSENT
+
+    def restore(self, before: str | _Absent) -> None:
+        if isinstance(before, str) and self.snapshot() != before:
+            try:
+                os.chdir(before)
+            except OSError:
+                pass
+
+
+class _WarningsWatchpoint(_Watchpoint):
+    """Watch the active :data:`warnings.filters` list."""
+
+    name = "warnings.filters"
+
+    def snapshot(self) -> list[t.Any]:
+        return list(warnings.filters)
+
+    def restore(self, before: list[t.Any]) -> None:
+        # Replace in place: other code may hold a reference to the list.
+        t.cast("list[t.Any]", warnings.filters)[:] = before
+
+
+class _SysModulesWatchpoint(_Watchpoint):
+    """Watch modules added to or removed from :data:`sys.modules`."""
+
+    name = "sys.modules"
+
+    def snapshot(self) -> dict[str, t.Any]:
+        return dict(sys.modules)
+
+    def diff(self, before: dict[str, t.Any], after: dict[str, t.Any]) -> list[LeakItem]:
+        items: list[LeakItem] = []
+
+        for key in sorted(before.keys() | after.keys()):
+            label = f"sys.modules[{key!r}]"
+
+            if key not in before:
+                items.append(LeakItem(label, ABSENT, after[key], "added"))
+            elif key not in after:
+                items.append(LeakItem(label, before[key], ABSENT, "removed"))
+
+        return items
+
+    def restore(self, before: dict[str, t.Any]) -> None:
+        for key in list(sys.modules):
+            if key not in before:
+                sys.modules.pop(key, None)
+
+        for key, module in before.items():
+            sys.modules.setdefault(key, module)
+
+
+class _LoggingWatchpoint(_Watchpoint):
+    """Watch the root logger configuration and named loggers."""
+
+    name = "logging"
+
+    @staticmethod
+    def _logger_state(logger: logging.Logger) -> tuple[t.Any, ...]:
+        return (
+            logger.level,
+            tuple(id(handler) for handler in logger.handlers),
+            logger.disabled,
+        )
+
+    def snapshot(self) -> dict[str, t.Any]:
+        root = logging.getLogger()
+        return {
+            "root_level": root.level,
+            "root_handlers": list(root.handlers),
+            "loggers": dict(logging.Logger.manager.loggerDict),
+        }
+
+    def diff(self, before: dict[str, t.Any], after: dict[str, t.Any]) -> list[LeakItem]:
+        items: list[LeakItem] = []
+
+        if before["root_level"] != after["root_level"]:
+            items.append(
+                LeakItem(
+                    "logging.root.level",
+                    before["root_level"],
+                    after["root_level"],
+                    "changed",
+                )
+            )
+
+        before_handlers = before["root_handlers"]
+        after_handlers = after["root_handlers"]
+
+        if [id(h) for h in before_handlers] != [id(h) for h in after_handlers]:
+            items.append(
+                LeakItem(
+                    "logging.root.handlers",
+                    before_handlers,
+                    after_handlers,
+                    "changed",
+                )
+            )
+
+        before_loggers = before["loggers"]
+        after_loggers = after["loggers"]
+
+        for name in sorted(before_loggers.keys() | after_loggers.keys()):
+            label = f"logging.getLogger({name!r})"
+            old = before_loggers.get(name, ABSENT)
+            new = after_loggers.get(name, ABSENT)
+
+            if old is ABSENT and new is not ABSENT:
+                items.append(LeakItem(label, ABSENT, new, "added"))
+            elif new is ABSENT and old is not ABSENT:
+                items.append(LeakItem(label, old, ABSENT, "removed"))
+            elif isinstance(old, logging.Logger) and isinstance(new, logging.Logger):
+                if self._logger_state(old) != self._logger_state(new):
+                    items.append(LeakItem(label, old, new, "changed"))
+            elif old is not new:
+                # Placeholder <-> Logger transition.
+                items.append(LeakItem(label, old, new, "changed"))
+
+        return items
+
+    def restore(self, before: dict[str, t.Any]) -> None:
+        root = logging.getLogger()
+        root.setLevel(before["root_level"])
+        root.handlers[:] = before["root_handlers"]
+
+        manager = logging.Logger.manager
+        old_loggers = before["loggers"]
+
+        for name in list(manager.loggerDict):
+            if name not in old_loggers:
+                manager.loggerDict.pop(name, None)
+
+        for name, logger in old_loggers.items():
+            if manager.loggerDict.get(name) is not logger:
+                manager.loggerDict[name] = logger
+
+
+class _ClickContextStackWatchpoint(_Watchpoint):
+    """Watch Click's thread-local context stack for leftover contexts."""
+
+    name = "click.globals._local.stack"
+
+    @staticmethod
+    def _get_stack() -> list[t.Any] | None:
+        return click_globals._local.__dict__.get("stack")
+
+    def snapshot(self) -> list[t.Any]:
+        stack = self._get_stack()
+        return list(stack) if stack is not None else []
+
+    def diff(self, before: list[t.Any], after: list[t.Any]) -> list[LeakItem]:
+        if [id(ctx) for ctx in before] != [id(ctx) for ctx in after]:
+            return [LeakItem(self.name, before, after, "changed")]
+
+        return []
+
+    def restore(self, before: list[t.Any]) -> None:
+        stack = self._get_stack()
+
+        if stack is not None:
+            while len(stack) > len(before):
+                stack.pop()
+
+
+class _GlobalWatchAdapter(_Watchpoint):
+    """Adapt a user-registered :class:`GlobalWatch` to a watchpoint."""
+
+    def __init__(self, name: str, watch: GlobalWatch) -> None:
+        self.name = name
+        self.watch = watch
+
+    def snapshot(self) -> t.Any:
+        value = getattr(self.watch.obj, self.watch.attr)
+
+        if self.watch.copier is not None:
+            value = self.watch.copier(value)
+
+        return value
+
+    def restore(self, before: t.Any) -> None:
+        setattr(self.watch.obj, self.watch.attr, before)
+
+
 class Result:
     """Holds the captured result of an invoked CLI script.
 
@@ -241,6 +808,12 @@ class Result:
     :param exception: The exception that happened if one did.
     :param exc_info: Exception information (exception type, exception instance,
         traceback type).
+    :param leak_report: Process-state leaks detected during the invocation.
+        ``None`` when leak detection was not enabled, otherwise an empty
+        :class:`LeakReport` when nothing leaked.
+
+    .. versionadded:: 8.6
+        Added ``leak_report``.
 
     .. versionchanged:: 8.2
         ``stderr_bytes`` no longer optional, ``output_bytes`` introduced and
@@ -258,6 +831,7 @@ class Result:
     exit_code: int
     exception: BaseException | None
     exc_info: ExceptionInfo | None
+    leak_report: LeakReport | None
 
     def __init__(
         self,
@@ -269,6 +843,7 @@ class Result:
         exit_code: int,
         exception: BaseException | None,
         exc_info: ExceptionInfo | None = None,
+        leak_report: LeakReport | None = None,
     ) -> None:
         self.runner = runner
         self.stdout_bytes = stdout_bytes
@@ -278,6 +853,7 @@ class Result:
         self.exit_code = exit_code
         self.exception = exception
         self.exc_info = exc_info
+        self.leak_report = leak_report
 
     @property
     def output(self) -> str:
@@ -336,6 +912,31 @@ class CliRunner:
         ``1`` and ``2`` via :func:`os.dup2` to a temporary file, also catching
         output from stale stream references, C extensions, and subprocesses.
         ``fd`` is not supported on Windows.
+    :param detect_leaks: Snapshot the process environment, working directory
+        and a convention list of global state before each invocation and
+        report what the invoked command left changed on
+        :attr:`Result.leak_report`. Keys overridden through the runner's own
+        isolation are not reported. Defaults to off, in which case there is
+        no snapshot overhead.
+    :param raise_on_leak: When leak detection is enabled, raise
+        :class:`LeakError` carrying the full :class:`LeakReport` as soon as a
+        non-empty report is produced.
+    :param restore_leaks: When leak detection is enabled, restore leaked
+        environment variables, the working directory and watched globals to
+        their entry values after the report is produced. The report still
+        records what leaked.
+    :param watch_env: Additional environment variable names to watch. All
+        environment variables are compared already; names listed here are
+        compared even when the runner itself overrides them through
+        isolation.
+    :param watch_globals: Additional global objects to watch, mapping a
+        report label to a :class:`GlobalWatch`. The defaults cover the
+        ``logging`` configuration, :data:`warnings.filters`,
+        :data:`sys.modules` and Click's context stack.
+
+    .. versionadded:: 8.6
+        Added the ``detect_leaks``, ``raise_on_leak``, ``restore_leaks``,
+        ``watch_env`` and ``watch_globals`` parameters.
 
     .. versionchanged:: 8.4.0
         Added the ``capture`` parameter. The default ``sys`` mode no longer
@@ -356,6 +957,11 @@ class CliRunner:
     echo_stdin: bool
     catch_exceptions: bool
     capture: CaptureMode
+    detect_leaks: bool
+    raise_on_leak: bool
+    restore_leaks: bool
+    watch_env: set[str]
+    watch_globals: dict[str, GlobalWatch]
 
     def __init__(
         self,
@@ -364,6 +970,12 @@ class CliRunner:
         echo_stdin: bool = False,
         catch_exceptions: bool = True,
         capture: CaptureMode = "sys",
+        *,
+        detect_leaks: bool = False,
+        raise_on_leak: bool = False,
+        restore_leaks: bool = False,
+        watch_env: cabc.Collection[str] | None = None,
+        watch_globals: cabc.Mapping[str, GlobalWatch] | None = None,
     ) -> None:
         if capture not in {"sys", "fd"}:
             raise ValueError(
@@ -378,6 +990,38 @@ class CliRunner:
         self.echo_stdin = echo_stdin
         self.catch_exceptions = catch_exceptions
         self.capture = capture
+        self.detect_leaks = detect_leaks
+        self.raise_on_leak = raise_on_leak
+        self.restore_leaks = restore_leaks
+        self.watch_env = set(watch_env) if watch_env else set()
+        self.watch_globals = dict(watch_globals) if watch_globals else {}
+
+    def _make_watchpoints(
+        self, env: cabc.Mapping[str, str | None] | None
+    ) -> list[_Watchpoint]:
+        """Build the watchpoints for one invocation.
+
+        The environment keys the runner overrides through its own isolation
+        are excluded: isolation restores them itself.
+        """
+        ignored = set(self.env)
+
+        if env:
+            ignored.update(env)
+
+        points: list[_Watchpoint] = [
+            _EnvironWatchpoint(ignored, self.watch_env),
+            _CwdWatchpoint(),
+            _LoggingWatchpoint(),
+            _WarningsWatchpoint(),
+            _SysModulesWatchpoint(),
+            _ClickContextStackWatchpoint(),
+        ]
+        points.extend(
+            _GlobalWatchAdapter(name, watch)
+            for name, watch in self.watch_globals.items()
+        )
+        return points
 
     def get_default_prog_name(self, cli: Command) -> str:
         """Given a command object it will return the default program name
@@ -601,6 +1245,9 @@ class CliRunner:
         env: cabc.Mapping[str, str | None] | None = None,
         catch_exceptions: bool | None = None,
         color: bool = False,
+        detect_leaks: bool | None = None,
+        raise_on_leak: bool | None = None,
+        restore_leaks: bool | None = None,
         **extra: t.Any,
     ) -> Result:
         """Invokes a command in an isolated environment.  The arguments are
@@ -620,9 +1267,20 @@ class CliRunner:
         :param catch_exceptions: Whether to catch any other exceptions than
                                  ``SystemExit``. If :data:`None`, the value
                                  from :class:`CliRunner` is used.
-        :param extra: the keyword arguments to pass to :meth:`main`.
         :param color: whether the output should contain color codes. The
                       application can still override this explicitly.
+        :param detect_leaks: Enable process-state leak detection for this
+                             invocation. If :data:`None`, the value from
+                             :class:`CliRunner` is used.
+        :param raise_on_leak: Override the runner's ``raise_on_leak`` setting
+                              for this invocation.
+        :param restore_leaks: Override the runner's ``restore_leaks`` setting
+                              for this invocation.
+
+        .. versionadded:: 8.6
+            Added the ``detect_leaks``, ``raise_on_leak`` and
+            ``restore_leaks`` parameters and the
+            :attr:`Result.leak_report` attribute.
 
         .. versionadded:: 8.2
             The result object has the ``output_bytes`` attribute with
@@ -650,6 +1308,28 @@ class CliRunner:
         if catch_exceptions is None:
             catch_exceptions = self.catch_exceptions
 
+        if detect_leaks is None:
+            detect_leaks = self.detect_leaks
+
+        if raise_on_leak is None:
+            raise_on_leak = self.raise_on_leak
+
+        if restore_leaks is None:
+            restore_leaks = self.restore_leaks
+
+        # Snapshot the process state at the entry of this invocation, before
+        # isolation replaces streams or environment variables. Each invoke
+        # compares against its own entry snapshot.
+        watchpoints: list[_Watchpoint] = []
+        before_state: list[t.Any] = []
+
+        if detect_leaks:
+            _prewarm_modules()
+            watchpoints = self._make_watchpoints(env)
+            before_state = [wp.snapshot() for wp in watchpoints]
+            inside_before_state: list[t.Any] = [None] * len(watchpoints)
+            inside_after_state: list[t.Any] = [None] * len(watchpoints)
+
         # Set up fd capture before isolation replaces sys.stdout and sys.stderr.
         cap_out: _FDCapture | None = None
         cap_err: _FDCapture | None = None
@@ -663,80 +1343,167 @@ class CliRunner:
             except OSError:
                 cap_out = cap_err = None
 
-        with self.isolation(input=input, env=env, color=color) as outstreams:
-            # Point the captured streams' fileno() at the saved (original)
-            # fd so that C-level consumers like faulthandler keep working
-            # while fd 1/2 are redirected to the capture tmpfile.
-            if cap_out is not None and cap_err is not None:
-                sys.stdout._original_fd = cap_out.saved_fd  # type: ignore[union-attr]
-                sys.stderr._original_fd = cap_err.saved_fd  # type: ignore[union-attr]
+        try:
+            with self.isolation(input=input, env=env, color=color) as outstreams:
+                # Snapshot explicitly watched keys after isolation applied its
+                # own environment overrides.
+                if detect_leaks:
+                    inside_before_state = [wp.snapshot_inside() for wp in watchpoints]
 
-            return_value = None
-            exception: BaseException | None = None
-            exit_code = 0
-
-            if isinstance(args, str):
-                args = shlex.split(args)
-
-            try:
-                prog_name = extra.pop("prog_name")
-            except KeyError:
-                prog_name = self.get_default_prog_name(cli)
-
-            try:
-                return_value = cli.main(args=args or (), prog_name=prog_name, **extra)
-            except SystemExit as e:
-                exc_info = sys.exc_info()
-                e_code = t.cast("int | t.Any | None", e.code)
-
-                if e_code is None:
-                    e_code = 0
-
-                if e_code != 0:
-                    exception = e
-
-                if not isinstance(e_code, int):
-                    sys.stdout.write(str(e_code))
-                    sys.stdout.write("\n")
-                    e_code = 1
-
-                exit_code = e_code
-
-            except Exception as e:
-                if not catch_exceptions:
-                    raise
-                exception = e
-                exit_code = 1
-                exc_info = sys.exc_info()
-            finally:
-                sys.stdout.flush()
-                sys.stderr.flush()
-
-                # Stop fd capture and merge the captured bytes into
-                # the stdout/stderr BytesIO streams. BytesIOCopy mirrors
-                # those writes into outstreams[2] automatically.
+                # Point the captured streams' fileno() at the saved (original)
+                # fd so that C-level consumers like faulthandler keep working
+                # while fd 1/2 are redirected to the capture tmpfile.
                 if cap_out is not None and cap_err is not None:
-                    fd_out = cap_out.stop()
-                    fd_err = cap_err.stop()
-                    if fd_out:
-                        outstreams[0].write(fd_out)
-                    if fd_err:
-                        outstreams[1].write(fd_err)
+                    sys.stdout._original_fd = cap_out.saved_fd  # type: ignore[union-attr]
+                    sys.stderr._original_fd = cap_err.saved_fd  # type: ignore[union-attr]
 
-                stdout = outstreams[0].getvalue()
-                stderr = outstreams[1].getvalue()
-                output = outstreams[2].getvalue()
+                return_value = None
+                exception: BaseException | None = None
+                exit_code = 0
 
-        return Result(
-            runner=self,
-            stdout_bytes=stdout,
-            stderr_bytes=stderr,
-            output_bytes=output,
-            return_value=return_value,
-            exit_code=exit_code,
-            exception=exception,
-            exc_info=exc_info,  # type: ignore
-        )
+                if isinstance(args, str):
+                    args = shlex.split(args)
+
+                try:
+                    prog_name = extra.pop("prog_name")
+                except KeyError:
+                    prog_name = self.get_default_prog_name(cli)
+
+                try:
+                    return_value = cli.main(
+                        args=args or (), prog_name=prog_name, **extra
+                    )
+                except SystemExit as e:
+                    exc_info = sys.exc_info()
+                    e_code = t.cast("int | t.Any | None", e.code)
+
+                    if e_code is None:
+                        e_code = 0
+
+                    if e_code != 0:
+                        exception = e
+
+                    if not isinstance(e_code, int):
+                        sys.stdout.write(str(e_code))
+                        sys.stdout.write("\n")
+                        e_code = 1
+
+                    exit_code = e_code
+
+                except Exception as e:
+                    if not catch_exceptions:
+                        raise
+                    exception = e
+                    exit_code = 1
+                    exc_info = sys.exc_info()
+                finally:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
+                    # Capture the inside-isolation values of explicitly
+                    # watched keys before isolation tears its overrides down.
+                    if detect_leaks:
+                        inside_after_state = [
+                            wp.snapshot_inside() for wp in watchpoints
+                        ]
+
+                    # Stop fd capture and merge the captured bytes into
+                    # the stdout/stderr BytesIO streams. BytesIOCopy mirrors
+                    # those writes into outstreams[2] automatically.
+                    if cap_out is not None and cap_err is not None:
+                        fd_out = cap_out.stop()
+                        fd_err = cap_err.stop()
+                        if fd_out:
+                            outstreams[0].write(fd_out)
+                        if fd_err:
+                            outstreams[1].write(fd_err)
+
+                    stdout = outstreams[0].getvalue()
+                    stderr = outstreams[1].getvalue()
+                    output = outstreams[2].getvalue()
+
+            result = Result(
+                runner=self,
+                stdout_bytes=stdout,
+                stderr_bytes=stderr,
+                output_bytes=output,
+                return_value=return_value,
+                exit_code=exit_code,
+                exception=exception,
+                exc_info=exc_info,  # type: ignore
+            )
+        except BaseException:
+            # The command escaped (usually catch_exceptions=False). Restore
+            # process state when configured, but never mask the original
+            # exception; there is no report to attach in that case.
+            if detect_leaks and restore_leaks:
+                self._restore_state(watchpoints, before_state)
+
+            raise
+
+        if detect_leaks:
+            result.leak_report = self._diff_state(
+                watchpoints,
+                before_state,
+                inside_before_state,
+                inside_after_state,
+            )
+
+            if restore_leaks:
+                self._restore_state(watchpoints, before_state)
+
+            if raise_on_leak and result.leak_report:
+                raise LeakError(result.leak_report)
+
+        return result
+
+    @staticmethod
+    def _diff_state(
+        watchpoints: cabc.Sequence[_Watchpoint],
+        before_state: cabc.Sequence[t.Any],
+        inside_before: cabc.Sequence[t.Any] | None = None,
+        inside_after: cabc.Sequence[t.Any] | None = None,
+    ) -> LeakReport:
+        """Compare fresh snapshots against entry snapshots and build a report."""
+        items: list[LeakItem] = []
+        inside_before = inside_before or []
+        inside_after = inside_after or []
+
+        for index, (watchpoint, before) in enumerate(
+            zip(watchpoints, before_state, strict=True)
+        ):
+            try:
+                after = watchpoint.snapshot()
+            except Exception:
+                continue
+
+            try:
+                items.extend(watchpoint.diff(before, after))
+            except Exception:
+                continue
+
+            if index < len(inside_before) and index < len(inside_after):
+                try:
+                    items.extend(
+                        watchpoint.diff_inside(
+                            inside_before[index], inside_after[index]
+                        )
+                    )
+                except Exception:
+                    continue
+
+        return LeakReport(items)
+
+    @staticmethod
+    def _restore_state(
+        watchpoints: cabc.Sequence[_Watchpoint], before_state: cabc.Sequence[t.Any]
+    ) -> None:
+        """Best-effort restoration of every watchpoint's entry value."""
+        for watchpoint, before in zip(watchpoints, before_state, strict=True):
+            try:
+                watchpoint.restore(before)
+            except Exception:
+                pass
 
     @contextlib.contextmanager
     def isolated_filesystem(

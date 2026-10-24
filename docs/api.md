@@ -363,3 +363,27 @@ customizing Click's shell completion system.
 .. autoclass:: Result
    :members:
 ```
+
+```{eval-rst}
+.. autoclass:: LeakReport
+   :members:
+```
+
+```{eval-rst}
+.. autoclass:: LeakItem
+   :members:
+```
+
+```{eval-rst}
+.. autoclass:: LeakError
+   :members:
+```
+
+```{eval-rst}
+.. autoclass:: GlobalWatch
+   :members:
+```
+
+```{eval-rst}
+.. autodata:: ABSENT
+```

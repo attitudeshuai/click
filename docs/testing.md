@@ -281,3 +281,139 @@ original `fd` through `fileno()`, reverting the change introduced in `8.3.3`
 that broke Pytest's `fd`-level capture teardown. Use `capture="fd"` to restore
 that behavior with proper isolation.
 ```
+
+## Leak detection
+
+A command runs in the same interpreter process as the test that invokes it.
+When it writes an environment variable, calls `os.chdir()`, configures
+`logging`, installs a `warnings` filter, imports a module or leaves a Click
+context pushed, that change stays in the process after the invocation
+returns. The next test then runs in an environment it never asked for, and
+the resulting failure appears in an unrelated place.
+
+{class}`CliRunner` can snapshot the process state before each invocation and
+report what the invoked command did not put back. Detection is opt-in: pass
+`detect_leaks=True` to the runner or to a single {meth}`CliRunner.invoke`,
+then inspect {attr}`Result.leak_report`.
+
+```python
+import os
+import click
+from click.testing import CliRunner
+
+
+@click.command()
+def deploy():
+    os.environ["DEPLOY_TARGET"] = "production"
+
+
+def test_leaks_are_reported():
+    runner = CliRunner(detect_leaks=True)
+    result = runner.invoke(deploy)
+
+    assert result.exit_code == 0
+    assert result.leak_report  # falsy when nothing leaked
+    item = result.leak_report[0]
+    assert item.name == "os.environ['DEPLOY_TARGET']"
+    assert item.change == "added"
+    assert item.before is click.testing.ABSENT
+    assert item.after == "production"
+    print(result.leak_report)
+```
+
+The printed report lists each difference with a readable before/after value:
+
+```text
+Process state leaked during CliRunner.invoke (1 item(s)):
+    added: os.environ['DEPLOY_TARGET']: <absent> -> 'production'
+```
+
+`change` is `"added"`, `"removed"` or `"changed"`. A value missing on one
+side is rendered as `<absent>` ({data}`ABSENT`). {class}`LeakReport` is
+iterable, has `added`, `removed` and `changed` convenience lists, and is
+falsy when empty.
+
+### What is watched
+
+By default detection snapshots and compares:
+
+- Every process environment variable (`os.environ`).
+- The working directory (`os.getcwd()`).
+- The root `logging` configuration and named loggers.
+- The active `warnings.filters` list.
+- The contents of `sys.modules`.
+- Click's thread-local context stack.
+
+Each invocation snapshots at its own entry and compares against that
+snapshot, so consecutive invocations do not interfere. A command that
+changes something and restores it before returning is reported as clean.
+Detection only observes state: it never changes the environment in which
+the command runs.
+
+Keys the runner itself overrides through {meth}`CliRunner.isolation` (the
+`env` arguments) are not reported, because isolation restores them itself.
+
+### Failing on leaks
+
+Pass `raise_on_leak=True` to turn any non-empty report into a
+{class}`LeakError` (an {exc}`AssertionError` subclass). The exception carries
+the full report as `error.report` and renders it in its message:
+
+```python
+runner = CliRunner(detect_leaks=True, raise_on_leak=True)
+runner.invoke(deploy)  # raises click.testing.LeakError
+```
+
+### Restoring leaked state
+
+By default detection reports only. Pass `restore_leaks=True` to restore
+environment variables, the working directory and the watched globals to
+their entry values after the report is produced. The report still records
+what leaked; restoration only affects subsequent code. When a command
+escapes with `catch_exceptions=False`, restoration still runs, but the
+original exception is propagated unchanged.
+
+### Extending the watch list
+
+- `watch_env` declares environment variable names of special interest. All
+  variables are compared already; a name listed here is additionally tracked
+  *inside* isolation, so mutating a value the runner itself overwrites
+  through `env` is reported too.
+- `watch_globals` maps a report label to a {class}`GlobalWatch` for any
+  attribute on a module or object. Pass `copier` (such as `list` or
+  `dict.copy`) when the value is mutated in place rather than reassigned.
+
+```python
+import myapp.config
+from click.testing import CliRunner, GlobalWatch
+
+runner = CliRunner(
+    detect_leaks=True,
+    watch_env=["MYAPP_TOKEN"],
+    watch_globals={
+        "myapp.config.MODE": GlobalWatch(myapp.config, "MODE"),
+        "myapp.config.SEEDS": GlobalWatch(myapp.config, "SEEDS", copier=list),
+    },
+)
+```
+
+Both `watch_env` and `watch_globals` are stored as plain attributes and can
+be appended to after the runner is created as well.
+
+### Interaction with `isolated_filesystem()`
+
+The two helpers keep separate responsibilities. The working directory is
+compared against the directory current *when `invoke` entered*, so an
+invocation started inside {meth}`CliRunner.isolated_filesystem` reports no
+working-directory leak as long as the command stays in the temporary
+directory. A command that chdirs elsewhere is still reported; the
+`isolated_filesystem()` context then restores the host directory on exit
+exactly as before.
+
+```{versionadded} 8.6
+Added process-state leak detection with `detect_leaks`, `raise_on_leak`,
+`restore_leaks`, `watch_env` and `watch_globals`, along with
+{attr}`Result.leak_report`, {class}`LeakReport`, {class}`LeakItem`,
+{class}`LeakError` and {class}`GlobalWatch`.
+```
+
